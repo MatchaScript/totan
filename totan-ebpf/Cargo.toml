@@ -1,0 +1,10 @@
+[package]
+name = "totan-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# eBPF-related dependencies will be added when implementing eBPF support
+# libbpf-rs = "0.20"
+# aya = "0.11"

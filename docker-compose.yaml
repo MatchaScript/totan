@@ -1,0 +1,81 @@
+services:
+  squid:
+    image: ubuntu/squid:latest
+    container_name: totan-squid
+    volumes:
+      - ./toolkit/squid.conf:/etc/squid/squid.conf:ro
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: "65536"
+        hard: "65536"
+  nginx:
+    image: nginx:alpine
+    container_name: totan-nginx
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+  nginx-proxy:
+    image: nginx:alpine
+    container_name: totan-nginx-proxy
+    restart: unless-stopped
+    ports:
+    - "8081:80"
+  explicit-totan: # For performance comparison only; not used in transparent proxy setup
+    build:
+      context: .
+      dockerfile: toolkit/Dockerfile
+    container_name: explicit-client
+    environment:
+      - HTTP_PROXY=http://squid:3128
+      - HTTPS_PROXY=http://squid:3128
+      - NO_PROXY=localhost,127.0.0.1,nginx
+    command: ["sleep", "infinity"]
+  totan:
+    build:
+      context: .
+      dockerfile: toolkit/Dockerfile
+    container_name: totan-client
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./toolkit/totan.docker.toml:/etc/totan/totan.toml:ro
+      - ./toolkit/proxy.pac:/etc/totan/proxy.pac:ro
+      - ./target/release/totan:/opt/totan/totan:ro
+    environment:
+      - NO_PROXY=localhost,127.0.0.1,nginx
+      - no_proxy=localhost,127.0.0.1,nginx
+      - PORT=3129
+      - USER_NAME=totan
+      - TEST_UID=999
+    depends_on:
+      - squid
+      - nginx
+    command: ["/usr/local/bin/start-totan.sh"]
+
+  go-transproxy:
+    build:
+      context: .
+      dockerfile: toolkit/Dockerfile.go-transproxy
+    container_name: go-transproxy
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - HTTP_PROXY_UPSTREAM=http://squid:3128
+      - HTTPS_PROXY_UPSTREAM=http://squid:3128
+      - NO_PROXY_LIST=localhost,127.0.0.1,nginx
+      - TEST_UID=999
+      - ENABLE_DNS_REDIRECT=true
+      # Optionals for DNS behavior
+      # - PUBLIC_DNS=8.8.8.8
+      # - PRIVATE_DNS=192.168.0.1
+      # - DNS_OVER_HTTPS=true
+    depends_on:
+      - squid
+      - nginx
+    command: ["/usr/local/bin/start-go-transproxy.sh"]
+
+networks:
+  default:
+    name: totan-net
+    driver: bridge

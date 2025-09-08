@@ -1,0 +1,21 @@
+# Rust
+target/
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# eBPF compiled objects
+*.o
+*.bpf.o
+
+# Reference implementation-specific files
+reference/

@@ -1,0 +1,30 @@
+# Main configuration for totan
+
+# The local port for totan to listen on (corresponds to --port).
+listen_port = 3129
+
+# The default upstream proxy URL (corresponds to --proxy).
+default_proxy = "http://proxy.example.com:8080"
+
+# PAC location (file path or URL) for dynamic proxy resolution (corresponds to --pac-location).
+pac_location = "/etc/totan/config.pac"
+
+# Packet interception mode: "netfilter" or "ebpf" (corresponds to --mode).
+interception_mode = "netfilter"
+
+# When interception_mode = "netfilter", choose backend: "iptables" or "nftables".
+# Default is "iptables".　
+# currently useless to generate config script
+netfilter_backend = "iptables"
+
+[logging]
+# Log level: "trace", "debug", "info", "warn", or "error".
+level = "info"
+# Log format: "text" for human-readable, "json" for machine-readable.
+format = "json"
+
+[timeouts]
+# Upstream connection timeout in milliseconds.
+upstream_connect_ms = 3000
+# Client connection idle timeout in seconds.
+client_idle_secs = 600

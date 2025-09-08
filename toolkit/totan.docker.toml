@@ -1,0 +1,30 @@
+# Configuration for totan in Docker container environment
+
+listen_port = 3129
+
+# Use squid service as upstream proxy if present
+default_proxy = "http://squid:3128"
+
+# PAC file inside the container (optional). If provided, it overrides default_proxy decisions.
+# Comment this out if you prefer default_proxy only.
+pac_file = "/etc/totan/proxy.pac"
+
+# Packet interception mode
+interception_mode = "netfilter"
+
+[logging]
+level = "debug"
+format = "text"
+
+[timeouts]
+upstream_connect_ms = 5000
+client_idle_secs = 300
+
+[mitigation]
+# Enable two retries with exponential backoff (200ms, 400ms, ...)
+retry_attempts = 2
+retry_backoff_ms = 200
+# Send RST on failure so clients retry fast
+rst_on_failure = true
+# Fall back to direct connection if proxy is temporarily unavailable
+try_direct_on_proxy_failure = true

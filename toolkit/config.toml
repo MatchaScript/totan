@@ -1,0 +1,28 @@
+# Configuration for totan in Docker container environment
+
+# The local port for totan to listen on
+listen_port = 3129
+
+# The default upstream proxy URL (using squid container)
+default_proxy = "http://squid:3128"
+
+# PAC location for dynamic proxy resolution
+pac_location = "/etc/totan/proxy.pac"
+
+# Packet interception mode
+interception_mode = "netfilter"
+
+# Netfilter backend
+netfilter_backend = "iptables"
+
+[logging]
+# Log level for debugging
+level = "debug"
+# Use text format for easier reading in container logs
+format = "text"
+
+[timeouts]
+# Upstream connection timeout in milliseconds
+upstream_connect_ms = 5000
+# Client connection idle timeout in seconds
+client_idle_secs = 300

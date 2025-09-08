@@ -1,0 +1,2 @@
+#!/bin/sh
+nft add rule nat output skuid 105 tcp dport {80, 443} redirect to 3129
