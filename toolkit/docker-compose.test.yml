@@ -1,0 +1,44 @@
+services:
+  totan:
+    build:
+      context: ..
+      dockerfile: toolkit/Dockerfile
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../target/debug/totan:/opt/totan/totan:ro
+      - ./totan.docker.toml:/etc/totan/totan.toml:ro
+      - ./proxy.pac:/etc/totan/proxy.pac:ro
+    environment:
+      - TEST_UID=999
+    depends_on:
+      - squid
+    networks:
+      - test-net
+
+  squid:
+    image: ubuntu/squid:latest
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+    networks:
+      - test-net
+
+  nginx:
+    image: nginx:latest
+    networks:
+      - test-net
+
+  tester:
+    build:
+      context: ..
+      dockerfile: toolkit/Dockerfile
+    command: ["tail", "-f", "/dev/null"]
+    user: "tester" # This is UID 999
+    networks:
+      - test-net
+    depends_on:
+      - totan
+
+networks:
+  test-net:
+    driver: bridge

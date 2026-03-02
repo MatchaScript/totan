@@ -1,15 +1,15 @@
+use crate::types::InterceptionMode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use crate::types::InterceptionMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TotanConfig {
     /// The local port for totan to listen on
     pub listen_port: u16,
-    
+
     /// The default upstream proxy URL
     pub default_proxy: Option<String>,
-    
+
     /// Path to the PAC file for dynamic proxy resolution
     pub pac_file: Option<PathBuf>,
 
@@ -20,15 +20,15 @@ pub struct TotanConfig {
     /// PAC result cache maximum number of entries
     #[serde(default = "default_pac_cache_max_entries")]
     pub pac_cache_max_entries: usize,
-    
+
     /// Packet interception mode: "netfilter" or "ebpf"
     #[serde(default)]
     pub interception_mode: InterceptionMode,
-    
+
     /// Logging configuration
     #[serde(default)]
     pub logging: LoggingConfig,
-    
+
     /// Timeout configuration
     #[serde(default)]
     pub timeouts: TimeoutConfig,
@@ -37,7 +37,7 @@ pub struct TotanConfig {
     #[serde(default)]
     pub mitigation: ErrorMitigationConfig,
 
-    /// Experimental: enable hyper-based HTTP proxy pipeline (absolute-form for all requests)
+    /// Experimental: enable Pingora-based HTTP proxy pipeline (absolute-form for all requests)
     #[serde(default)]
     pub experimental_hyper_http: bool,
 }
@@ -47,7 +47,7 @@ pub struct LoggingConfig {
     /// Log level: "trace", "debug", "info", "warn", or "error"
     #[serde(default = "default_log_level")]
     pub level: String,
-    
+
     /// Log format: "text" for human-readable, "json" for machine-readable
     #[serde(default = "default_log_format")]
     pub format: String,
@@ -75,7 +75,7 @@ pub struct TimeoutConfig {
     /// Upstream connection timeout in milliseconds
     #[serde(default = "default_upstream_connect_ms")]
     pub upstream_connect_ms: u64,
-    
+
     /// Client connection idle timeout in seconds
     #[serde(default = "default_client_idle_secs")]
     pub client_idle_secs: u64,
@@ -145,10 +145,22 @@ impl Default for ErrorMitigationConfig {
     }
 }
 
-fn default_retry_attempts() -> u32 { 2 }
-fn default_retry_backoff_ms() -> u64 { 200 }
-fn default_rst_on_failure() -> bool { true }
-fn default_try_direct_on_proxy_failure() -> bool { true }
+fn default_retry_attempts() -> u32 {
+    2
+}
+fn default_retry_backoff_ms() -> u64 {
+    200
+}
+fn default_rst_on_failure() -> bool {
+    true
+}
+fn default_try_direct_on_proxy_failure() -> bool {
+    true
+}
 
-fn default_pac_cache_ttl_secs() -> u64 { 60 }
-fn default_pac_cache_max_entries() -> usize { 4096 }
+fn default_pac_cache_ttl_secs() -> u64 {
+    60
+}
+fn default_pac_cache_max_entries() -> usize {
+    4096
+}
