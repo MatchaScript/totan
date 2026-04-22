@@ -69,7 +69,7 @@ impl Loader {
         tproxy_port: u16,
         fwmark: u32,
     ) -> anyhow::Result<Self> {
-        let elf = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/totan-ebpf"));
+        let elf = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/totan_bpf"));
 
         let mut ebpf = EbpfLoader::new().load(elf)?;
 
