@@ -44,13 +44,15 @@ impl PacketInterceptor {
         use crate::ebpf::Loader;
         use std::net::Ipv4Addr;
 
-        let uplink = self
+        let ingress_iface = self
             .config
             .ebpf
-            .uplink_interface
+            .ingress_interface
             .as_deref()
             .ok_or_else(|| {
-                anyhow::anyhow!("`ebpf.uplink_interface` must be set when interception_mode = ebpf")
+                anyhow::anyhow!(
+                    "`ebpf.ingress_interface` must be set when interception_mode = ebpf"
+                )
             })?;
         let tproxy_port = self
             .config
@@ -70,7 +72,8 @@ impl PacketInterceptor {
         // Loader is held inside this future; dropping it on shutdown detaches
         // the tc program and releases the map.
         let fwmark = self.config.ebpf.fwmark;
-        let _loader = Loader::load_and_attach(uplink, Ipv4Addr::LOCALHOST, tproxy_port, fwmark)?;
+        let _loader =
+            Loader::load_and_attach(ingress_iface, Ipv4Addr::LOCALHOST, tproxy_port, fwmark)?;
 
         accept_loop(listener, connection_manager, OriginalDstSource::SkAssign).await
     }

@@ -1,6 +1,6 @@
 # totan configuration for the eBPF e2e CI test.
-# toolkit/e2e/run.sh ebpf creates the dummy-uplink interface and pod netns
-# and spawns three mock proxies (8880/8881/8882) before starting totan here.
+# toolkit/e2e/run.sh ebpf creates the pod netns + host-side veth and spawns
+# three mock proxies (8880/8881/8882) before starting totan here.
 
 listen_port = 3129
 
@@ -27,10 +27,11 @@ rst_on_failure = true
 try_direct_on_proxy_failure = false
 
 [ebpf]
-# Created by run.sh as a dummy "uplink" interface.
-uplink_interface = "dummy-uplink"
+# Host side of the veth pair carrying pod traffic — the tc ingress classifier
+# picks up pod-originated SYNs here and sk_assigns them to the TPROXY listener.
+ingress_interface = "veth-host"
 tproxy_port = 3129
-# fwmark placed on sk_assign'd packets; the fwmark ip rule is installed with
-# lower priority number (checked first) than the pod-subnet ip rule so
-# TPROXY'd packets route locally instead of looping back out dummy-uplink.
+# Set on sk_assign'd packets; the loader installs
+# `ip rule fwmark <N> lookup 100` + `ip route local 0.0.0.0/0 dev lo table 100`
+# so marked packets get delivered locally regardless of their dst IP.
 fwmark = 0x7474

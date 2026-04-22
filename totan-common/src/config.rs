@@ -48,14 +48,15 @@ pub struct TotanConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EbpfConfig {
-    /// Name of the uplink network interface to attach the tc egress classifier to
-    /// (e.g. "eth0", "ens5"). Required when `interception_mode = "ebpf"`.
+    /// Host-side interface carrying traffic *from* clients we want to intercept
+    /// (e.g. the host-peer of a pod's veth or netkit). The tc ingress classifier
+    /// is attached here. Required when `interception_mode = "ebpf"`.
     #[serde(default)]
-    pub uplink_interface: Option<String>,
+    pub ingress_interface: Option<String>,
 
-    /// Localhost TPROXY listener port. The tc egress program redirects matching
-    /// flows to `127.0.0.1:<tproxy_port>` via `bpf_sk_assign`. Defaults to the
-    /// top-level `listen_port` when unset.
+    /// Localhost TPROXY listener port. The tc ingress program assigns matching
+    /// flows to the listener at `127.0.0.1:<tproxy_port>` via `bpf_sk_assign`.
+    /// Defaults to the top-level `listen_port` when unset.
     #[serde(default)]
     pub tproxy_port: Option<u16>,
 
@@ -76,7 +77,7 @@ fn default_fwmark() -> u32 {
 impl Default for EbpfConfig {
     fn default() -> Self {
         Self {
-            uplink_interface: None,
+            ingress_interface: None,
             tproxy_port: None,
             fwmark: default_fwmark(),
         }

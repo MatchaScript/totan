@@ -1,13 +1,14 @@
-//! Aya loader for the tc egress classifier that hijacks TCP/80 and TCP/443 to
-//! a local TPROXY listener.
+//! Aya loader for the tc ingress classifier that hijacks TCP/80 and TCP/443
+//! arriving from clients (e.g. pod-facing veth or netkit host peer) and
+//! delivers them to a local TPROXY listener via `bpf_sk_assign`.
 //!
 //! ## Required host setup
 //!
 //! After `Loader::load_and_attach`, the caller (or a cluster administrator)
 //! must ensure the following policy routing rules are present. Without them
 //! `ip_route_input()` won't find a local route for external dst IPs, and the
-//! bpf_redirect'd packets will be forwarded/dropped instead of delivered to
-//! the TPROXY socket:
+//! `sk_assign`-tagged packets will be forwarded/dropped instead of delivered
+//! to the TPROXY socket:
 //!
 //! ```text
 //! ip rule add fwmark <FWMARK> lookup 100 priority 100
@@ -16,6 +17,14 @@
 //!
 //! `Loader::setup_policy_routing` applies these rules automatically at startup
 //! and removes them on drop if `cleanup_on_drop` is set.
+//!
+//! ## Why tc ingress
+//!
+//! `bpf_sk_assign` is gated in the kernel to the tc ingress path
+//! (`net/core/filter.c`: `if (!skb_at_tc_ingress(skb)) return -EOPNOTSUPP;`).
+//! For client-originated traffic, tc ingress of the host-side peer of the
+//! client's network pair device (veth / netkit) is the first tc hook the
+//! packet reaches on the host and is the natural attach point.
 
 use std::net::Ipv4Addr;
 use std::process::Command;
@@ -60,11 +69,11 @@ pub struct Loader {
 }
 
 impl Loader {
-    /// Load the tc egress program, configure the `TOTAN_CONFIG` map, tcx-attach
-    /// it to `uplink` with first-position ordering, then configure policy routing
-    /// so fwmark-tagged packets are delivered locally.
+    /// Load the tc ingress program, configure the `TOTAN_CONFIG` map,
+    /// tcx-attach it to `ingress_iface` with first-position ordering, then
+    /// configure policy routing so fwmark-tagged packets are delivered locally.
     pub fn load_and_attach(
-        uplink: &str,
+        ingress_iface: &str,
         tproxy_addr: Ipv4Addr,
         tproxy_port: u16,
         fwmark: u32,
@@ -91,26 +100,26 @@ impl Loader {
         config_map.set(0, cfg, 0)?;
 
         let program: &mut SchedClassifier = ebpf
-            .program_mut("totan_tc_egress")
-            .ok_or_else(|| anyhow::anyhow!("totan_tc_egress not found in ELF"))?
+            .program_mut("totan_tc_ingress")
+            .ok_or_else(|| anyhow::anyhow!("totan_tc_ingress not found in ELF"))?
             .try_into()?;
         program.load()?;
 
         // tcx attach with first-position ordering for Cilium coexistence.
         // `LinkOrder::first()` installs us before any existing tcx programs on
-        // the same hook so bpf_sk_assign runs before downstream masquerade.
+        // the same hook so sk_assign runs before downstream policy/NAT.
         let link_id = program.attach_with_options(
-            uplink,
-            TcAttachType::Egress,
+            ingress_iface,
+            TcAttachType::Ingress,
             TcAttachOptions::TcxOrder(LinkOrder::first()),
         )?;
         let link = program.take_link(link_id)?;
 
         info!(
-            interface = uplink,
+            interface = ingress_iface,
             tproxy = %format!("{}:{}", tproxy_addr, tproxy_port),
             fwmark = format!("0x{:04X}", fwmark),
-            "totan eBPF tc egress attached"
+            "totan eBPF tc ingress attached"
         );
 
         let owned = setup_policy_routing(fwmark)?;

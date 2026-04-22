@@ -14,10 +14,13 @@
 #              (curl) runs as that uid on the host netns; totan listens on
 #              127.0.0.1:3129 and reads SO_ORIGINAL_DST on accept.
 #
-#   ebpf:      pod netns with veth pair, host-side dummy "uplink" as the tcx
-#              egress attach point. totan attaches the tc program, sets up
-#              fwmark policy routing, and binds an IP_TRANSPARENT listener
-#              that recovers the original dst via getsockname().
+#   ebpf:      pod netns with veth pair. totan attaches a tcx ingress program
+#              on the host-side veth (the first tc hook pod-originated packets
+#              hit on the host), sets up fwmark policy routing, and binds an
+#              IP_TRANSPARENT listener that recovers the original dst via
+#              getsockname(). `bpf_sk_assign` is tc-ingress-only at the kernel
+#              level, which is why we hook veth-host ingress rather than an
+#              uplink egress.
 #
 # Scenario layout (host→target mapping via curl --resolve, all in TEST-NET):
 #   plain.test       → 192.0.2.10  port 80  (plain HTTP, default proxy)
@@ -56,7 +59,6 @@ TEST_USER="totan-e2e-client"
 
 # ebpf-mode isolation primitives
 POD_NS="totan-e2e-pod"
-DUMMY_IF="dummy-uplink"
 
 PROXY_PIDS=()
 TOTAN_PID=""
@@ -77,11 +79,9 @@ cleanup() {
     else
         ip rule del fwmark 0x7474 lookup 100 2>/dev/null
         ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
-        ip rule del from 10.100.0.0/24 lookup 200 2>/dev/null
-        ip route del table 200 default dev "$DUMMY_IF" 2>/dev/null
         ip netns del "$POD_NS" 2>/dev/null
+        # Deleting one end of the pair removes both.
         ip link del veth-host 2>/dev/null
-        ip link del "$DUMMY_IF" 2>/dev/null
     fi
 
     # Preserve log directory on failure; remove on success.
@@ -155,31 +155,26 @@ else  # ebpf
     KVER=$(uname -r)
     echo "[e2e] kernel $KVER (need ≥ 6.6 for tcx)"
 
-    echo "[e2e] ebpf: setting up pod netns + dummy uplink..."
-    sysctl -qw net.ipv4.ip_forward=1
+    echo "[e2e] ebpf: setting up pod netns..."
+    # The fwmark-tagged packet enters local delivery via dev lo even though it
+    # arrived on veth-host, so rp_filter could reject the src=10.100.0.2
+    # reverse-path check. Loosen on all + the specific ingress device.
     sysctl -qw net.ipv4.conf.all.rp_filter=0
-
-    ip link add "$DUMMY_IF" type dummy
-    ip link set "$DUMMY_IF" up
-    sysctl -qw "net.ipv4.conf.${DUMMY_IF//-/_}.rp_filter=0" 2>/dev/null || true
 
     ip netns add "$POD_NS"
     ip link add veth-host type veth peer name veth-pod
     ip link set veth-pod netns "$POD_NS"
     ip link set veth-host up
     ip addr add 10.100.0.1/24 dev veth-host
+    sysctl -qw net.ipv4.conf.veth-host.rp_filter=0 2>/dev/null || true
 
     ip netns exec "$POD_NS" ip link set lo up
     ip netns exec "$POD_NS" ip link set veth-pod up
     ip netns exec "$POD_NS" ip addr add 10.100.0.2/24 dev veth-pod
     ip netns exec "$POD_NS" ip route add default via 10.100.0.1
 
-    # priority 100 = fwmark rule (checked first → local delivery for TPROXY'd packets)
-    # priority 200 = from-pod rule (forward pod traffic out dummy-uplink)
-    # Note: totan also installs the fwmark rule at priority 100; duplicate
-    # rules are fine — keeping both makes the setup explicit here for debugging.
-    ip rule add from 10.100.0.0/24 lookup 200 priority 200
-    ip route add table 200 default dev "$DUMMY_IF"
+    # totan installs `ip rule fwmark 0x7474 lookup 100` + the local-delivery
+    # route in table 100 automatically on startup; no manual routing needed.
 
     CURL_PREFIX=(ip netns exec "$POD_NS")
 fi
