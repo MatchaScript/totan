@@ -1,0 +1,30 @@
+# totan configuration for the netfilter e2e CI test.
+# toolkit/e2e/run.sh netfilter creates the iptables REDIRECT rule and spawns
+# three mock proxies (8880/8881/8882) before starting totan with this config.
+
+listen_port = 3129
+
+# Fallback when PAC returns DIRECT or fails to load.
+default_proxy = "http://127.0.0.1:8880"
+
+# PAC is the primary routing policy under test. $PAC_PATH is substituted by
+# run.sh at startup with the absolute path to toolkit/e2e/test.pac.
+pac_file = "__PAC_PATH__"
+
+interception_mode = "netfilter"
+
+[logging]
+level = "debug"
+format = "text"
+
+[timeouts]
+upstream_connect_ms = 5000
+
+[mitigation]
+retry_attempts = 1
+retry_backoff_ms = 100
+rst_on_failure = true
+# In CI, the mock proxies are guaranteed reachable — don't fall back to direct
+# (TEST-NET destinations are unreachable, so a direct fallback would time out
+# and flake the test).
+try_direct_on_proxy_failure = false

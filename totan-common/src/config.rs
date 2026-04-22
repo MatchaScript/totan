@@ -37,9 +37,50 @@ pub struct TotanConfig {
     #[serde(default)]
     pub mitigation: ErrorMitigationConfig,
 
+    /// eBPF-specific configuration (only consulted when `interception_mode = "ebpf"`)
+    #[serde(default)]
+    pub ebpf: EbpfConfig,
+
     /// Experimental: enable Pingora-based HTTP proxy pipeline (absolute-form for all requests)
     #[serde(default)]
     pub experimental_hyper_http: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EbpfConfig {
+    /// Name of the uplink network interface to attach the tc egress classifier to
+    /// (e.g. "eth0", "ens5"). Required when `interception_mode = "ebpf"`.
+    #[serde(default)]
+    pub uplink_interface: Option<String>,
+
+    /// Localhost TPROXY listener port. The tc egress program redirects matching
+    /// flows to `127.0.0.1:<tproxy_port>` via `bpf_sk_assign`. Defaults to the
+    /// top-level `listen_port` when unset.
+    #[serde(default)]
+    pub tproxy_port: Option<u16>,
+
+    /// fwmark placed on packets after `bpf_sk_assign` so the kernel's policy
+    /// routing delivers them locally instead of forwarding. The loader
+    /// automatically installs `ip rule fwmark <N> lookup 100` and
+    /// `ip route local 0.0.0.0/0 dev lo table 100` at startup.
+    /// Must not overlap with Cilium's mark range (0x0200–0x0E00).
+    /// Default: 0x7474.
+    #[serde(default = "default_fwmark")]
+    pub fwmark: u32,
+}
+
+fn default_fwmark() -> u32 {
+    0x7474 // "tt" for totan; distinct from Cilium's 0x0200–0x0E00 range
+}
+
+impl Default for EbpfConfig {
+    fn default() -> Self {
+        Self {
+            uplink_interface: None,
+            tproxy_port: None,
+            fwmark: default_fwmark(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +151,7 @@ impl Default for TotanConfig {
             logging: Default::default(),
             timeouts: Default::default(),
             mitigation: Default::default(),
+            ebpf: Default::default(),
             experimental_hyper_http: false,
         }
     }

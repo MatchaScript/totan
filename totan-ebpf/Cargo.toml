@@ -3,8 +3,15 @@ name = "totan-ebpf"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+publish = false
 
 [dependencies]
-# eBPF-related dependencies will be added when implementing eBPF support
-# libbpf-rs = "0.20"
-# aya = "0.11"
+aya-ebpf = { workspace = true }
+network-types = { workspace = true }
+
+[[bin]]
+name = "totan-ebpf"
+path = "src/main.rs"
+# Profile tuning for this crate lives in the workspace root Cargo.toml under
+# `[profile.*.package.totan-ebpf]` — profile tables inside non-root members
+# are silently ignored by cargo.

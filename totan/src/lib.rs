@@ -1,5 +1,7 @@
 pub mod cli;
 pub mod connection;
+#[cfg(feature = "ebpf")]
+pub mod ebpf;
 pub mod http_proxy;
 pub mod interceptor;
 pub mod pac;

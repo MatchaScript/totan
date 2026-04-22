@@ -6,6 +6,15 @@ members = [
 	"totan-ebpf",
 ]
 
+# `totan-ebpf` targets `bpfel-unknown-none` via its own `.cargo/config.toml`
+# and must not be built as part of the default cargo invocation for the host
+# toolchain. The userspace `totan` crate's `build.rs` drives its compilation
+# through `aya-build` when the `ebpf` feature is enabled.
+default-members = [
+	"totan",
+	"totan-common",
+]
+
 resolver = "2"
 
 [workspace.package]
@@ -15,6 +24,24 @@ repository = "https://github.com/matchascript/totan"
 homepage = "https://github.com/matchascript/totan"
 readme = "README.md"
 authors = ["totan contributors"]
+
+# BPF backend requires aggressive inlining and no panic landing pads. These
+# overrides only apply when building the `totan-ebpf` crate with
+# bpfel-unknown-none; the userspace crates keep their normal profiles.
+[profile.dev.package.totan-ebpf]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 1
+
+[profile.release.package.totan-ebpf]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+codegen-units = 1
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -33,3 +60,10 @@ nix = { version = "0.30", features = ["socket", "net"] }
 boa_engine = "0.20"
 once_cell = "1"
 
+# eBPF
+aya = "0.13.1"
+aya-log = "0.2.1"
+aya-ebpf = "0.1.1"
+aya-log-ebpf = "0.1.1"
+aya-build = "=0.1.3"
+network-types = "0.0.7"

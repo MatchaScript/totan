@@ -21,7 +21,11 @@ nix = { workspace = true, features = ["socket", "net"] }
 boa_engine = { workspace = true }
 once_cell = { workspace = true }
 totan-common = { path = "../totan-common" }
-totan-ebpf = { path = "../totan-ebpf", optional = true }
+
+# eBPF userspace loader deps (only pulled in under the `ebpf` feature).
+aya = { workspace = true, optional = true }
+aya-log = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
 
 # New HTTP stack (Phase 1 experimental)
 hyper = { version = "1", features = ["http1", "client", "server"] }
@@ -36,7 +40,20 @@ bytes = "1"
 [features]
 default = ["netfilter"]
 netfilter = []
-ebpf = ["dep:totan-ebpf"]
+ebpf = [
+	"dep:aya",
+	"dep:aya-log",
+	"dep:libc",
+	"dep:aya-build",
+	"totan-common/ebpf",
+]
+
+# `aya-build` drives the bpfel-unknown-none compile of `totan-ebpf` from
+# `build.rs`. It's only needed when the `ebpf` feature is on; marking it
+# optional keeps the default `cargo check` free of the nightly toolchain
+# requirement.
+[build-dependencies]
+aya-build = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

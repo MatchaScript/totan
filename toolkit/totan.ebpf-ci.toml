@@ -1,0 +1,36 @@
+# totan configuration for the eBPF e2e CI test.
+# toolkit/e2e/run.sh ebpf creates the dummy-uplink interface and pod netns
+# and spawns three mock proxies (8880/8881/8882) before starting totan here.
+
+listen_port = 3129
+
+# Fallback when PAC returns DIRECT or fails to load.
+default_proxy = "http://127.0.0.1:8880"
+
+# PAC is the primary routing policy under test. $PAC_PATH is substituted by
+# run.sh at startup with the absolute path to toolkit/e2e/test.pac.
+pac_file = "__PAC_PATH__"
+
+interception_mode = "ebpf"
+
+[logging]
+level = "debug"
+format = "text"
+
+[timeouts]
+upstream_connect_ms = 5000
+
+[mitigation]
+retry_attempts = 1
+retry_backoff_ms = 100
+rst_on_failure = true
+try_direct_on_proxy_failure = false
+
+[ebpf]
+# Created by run.sh as a dummy "uplink" interface.
+uplink_interface = "dummy-uplink"
+tproxy_port = 3129
+# fwmark placed on sk_assign'd packets; the fwmark ip rule is installed with
+# lower priority number (checked first) than the pod-subnet ip rule so
+# TPROXY'd packets route locally instead of looping back out dummy-uplink.
+fwmark = 0x7474

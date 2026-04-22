@@ -27,11 +27,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Create packet interceptor based on mode
-    let interceptor = PacketInterceptor::new(config.interception_mode, config.listen_port)?;
-    info!(
-        "Packet interceptor initialized in {:?} mode",
-        config.interception_mode
-    );
+    let mode = config.interception_mode;
+    let interceptor = PacketInterceptor::new(config.clone())?;
+    info!("Packet interceptor initialized in {:?} mode", mode);
 
     // Create connection manager
     let connection_manager = Arc::new(ConnectionManager::new(config.clone()).await?);

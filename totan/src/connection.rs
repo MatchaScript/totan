@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use totan_common::{config::TotanConfig, InterceptedConnection};
@@ -45,10 +45,8 @@ impl ConnectionManager {
         &self,
         mut stream: TcpStream,
         client_addr: SocketAddr,
+        original_dest: SocketAddr,
     ) -> Result<()> {
-        // Get original destination from SO_ORIGINAL_DST
-        let original_dest = get_original_destination(&stream)?;
-
         debug!(
             "Intercepted connection: {} -> {} (original: {})",
             client_addr,
@@ -139,32 +137,5 @@ impl ConnectionManager {
                 self.pac_engine.is_none(),
             )
             .await
-    }
-}
-
-fn get_original_destination(stream: &TcpStream) -> Result<SocketAddr> {
-    #[cfg(target_os = "linux")]
-    {
-        use nix::sys::socket::{getsockopt, sockopt::OriginalDst};
-        use std::os::fd::BorrowedFd;
-        use std::os::unix::io::AsRawFd;
-
-        let fd = stream.as_raw_fd();
-        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        let orig_dst = getsockopt(&borrowed_fd, OriginalDst)?;
-        let addr = SocketAddrV4::new(
-            std::net::Ipv4Addr::from(orig_dst.sin_addr.s_addr.to_be()),
-            orig_dst.sin_port.to_be(),
-        );
-        Ok(SocketAddr::V4(addr))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Fallback for non-Linux platforms
-        // This won't work for transparent proxying, but prevents compilation errors
-        stream
-            .peer_addr()
-            .map_err(|e| anyhow::anyhow!("Cannot get original destination: {}", e))
     }
 }
