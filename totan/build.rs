@@ -17,7 +17,7 @@ fn main() {
             no_default_features: false,
             features: &[],
         }],
-        Toolchain::Custom("nightly-2025-02-20"),
+        Toolchain::Custom("nightly-2026-03-01"),
     )
     .expect("failed to build totan-ebpf");
 }

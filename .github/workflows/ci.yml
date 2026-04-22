@@ -12,7 +12,7 @@ jobs:
     name: Check & Test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -33,12 +33,12 @@ jobs:
     name: Build (netfilter)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build totan (netfilter)
         run: cargo build -p totan --release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: totan-netfilter-release
           path: target/release/totan
@@ -49,18 +49,18 @@ jobs:
     name: Build (eBPF)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
 
       # The nightly channel pinned in totan-ebpf/rust-toolchain.toml that
       # aya-build invokes via `rustup run`.
-      - name: Install nightly-2025-02-20 for the eBPF crate
-        run: rustup toolchain install nightly-2025-02-20 --component rust-src --no-self-update
+      - name: Install nightly-2026-03-01 for the eBPF crate
+        run: rustup toolchain install nightly-2026-03-01 --component rust-src --no-self-update
 
       # bpf-linker takes ~5 min to build from source; cache the installed bin.
       - name: Cache bpf-linker
         id: cache-bpf-linker
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/bpf-linker
           key: bpf-linker-${{ runner.os }}-v1
@@ -74,7 +74,7 @@ jobs:
       - name: Build totan (with eBPF)
         run: cargo build -p totan --features ebpf --release
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: totan-ebpf-release
           path: target/release/totan
@@ -87,8 +87,8 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build-netfilter
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           name: totan-netfilter-release
           path: target/release/
@@ -106,8 +106,8 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build-ebpf
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           name: totan-ebpf-release
           path: target/release/

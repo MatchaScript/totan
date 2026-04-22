@@ -249,11 +249,13 @@ run_curl() {
 
 echo
 echo "── scenario 1: plain HTTP → default proxy ──────────────────────────────"
-# PAC receives host=IP (totan doesn't parse Host header for plain HTTP), so
-# the PAC default branch fires → proxy-default (8880).
+# PAC resolution uses the original dst IP (no SNI / Host inspection at that
+# stage), so the IP falls through to the PAC default → proxy-default (8880).
+# When forwarding upstream, totan rewrites the request-URI from the Host
+# header per RFC 7230, so the proxy sees the hostname form.
 body=$(run_curl --resolve 'plain.test:80:192.0.2.10' 'http://plain.test/')
 echo "  body: $body"
-assert_log_contains "$PROXY_DEFAULT_LOG" "GET http://192.0.2.10/" "plain-http"
+assert_log_contains "$PROXY_DEFAULT_LOG" "GET http://plain.test/" "plain-http"
 if [[ "$body" == *"proxy-default:"* ]]; then
     echo "  ✓ plain-http: response body contains proxy-default identifier"
     pass=$((pass + 1))

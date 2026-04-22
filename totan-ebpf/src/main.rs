@@ -71,7 +71,10 @@ pub fn totan_tc_egress(ctx: TcContext) -> i32 {
 #[inline(always)]
 fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     let eth: EthHdr = ctx.load(0).map_err(|_| ())?;
-    if eth.ether_type != EtherType::Ipv4 {
+    // Copy out the packed field before comparing — taking &eth.ether_type
+    // on a #[repr(C, packed)] struct is UB under rustc ≥ 1.94 (E0793).
+    let ether_type = eth.ether_type;
+    if ether_type != EtherType::Ipv4 {
         return Ok(TC_ACT_OK as i32);
     }
 
@@ -97,12 +100,11 @@ fn try_egress(ctx: &TcContext) -> Result<i32, ()> {
     // Build a 4-tuple keyed only on the listener (src fields zeroed): this
     // matches the passively-listening TPROXY socket regardless of the flow.
     let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
-    unsafe {
-        tuple.__bindgen_anon_1.ipv4.saddr = 0;
-        tuple.__bindgen_anon_1.ipv4.sport = 0;
-        tuple.__bindgen_anon_1.ipv4.daddr = cfg.tproxy_ipv4_be;
-        tuple.__bindgen_anon_1.ipv4.dport = cfg.tproxy_port_be;
-    }
+    // Writes to Copy union fields are safe (RFC 1444); no unsafe block needed.
+    tuple.__bindgen_anon_1.ipv4.saddr = 0;
+    tuple.__bindgen_anon_1.ipv4.sport = 0;
+    tuple.__bindgen_anon_1.ipv4.daddr = cfg.tproxy_ipv4_be;
+    tuple.__bindgen_anon_1.ipv4.dport = cfg.tproxy_port_be;
     let tuple_size = mem::size_of_val(unsafe { &tuple.__bindgen_anon_1.ipv4 }) as u32;
 
     // Keep a typed pointer for field access (mark, ifindex) and a void pointer
