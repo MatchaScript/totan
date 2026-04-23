@@ -126,6 +126,7 @@ if [[ "$MODE" == "netfilter" ]]; then
 else  # ebpf
     echo "[stress] ebpf: setting up pod netns..."
     sysctl -qw net.ipv4.conf.all.rp_filter=0
+    sysctl -qw net.ipv4.tcp_tw_reuse=1
 
     ip netns add "$POD_NS"
     ip link add veth-st-host type veth peer name veth-st-pod
@@ -173,14 +174,19 @@ run_bench() {
     # ab exits non-zero on failures; capture output regardless.
     "${AB_PREFIX[@]}" ab -n "$n" -c "$c" -s 10 "$TARGET" >"$out" 2>&1 || true
 
-    # Print the summary block (from "Server Software:" onward).
-    awk '/^Server Software:/,0' "$out" || cat "$out"
+    # Print the summary block, or the raw output when no summary was produced.
+    if grep -q '^Server Software:' "$out" 2>/dev/null; then
+        awk '/^Server Software:/,0' "$out"
+    else
+        echo "(ab produced no standard summary; raw output below)"
+        cat "$out"
+    fi
     echo
 
     local failed complete rps rps_int fail_pct
-    failed=$(awk  '/^Failed requests:/{print $3}'     "$out" 2>/dev/null || echo "?")
-    complete=$(awk '/^Complete requests:/{print $3}'  "$out" 2>/dev/null || echo "0")
-    rps=$(awk     '/^Requests per second:/{print $4}' "$out" 2>/dev/null || echo "0")
+    failed=$(awk  '/^Failed requests:/{print $3}'     "$out" 2>/dev/null); failed="${failed:-?}"
+    complete=$(awk '/^Complete requests:/{print $3}'  "$out" 2>/dev/null); complete="${complete:-0}"
+    rps=$(awk     '/^Requests per second:/{print $4}' "$out" 2>/dev/null); rps="${rps:-0}"
     rps_int="${rps%%.*}"
 
     # ── failure-rate assertion ────────────────────────────────────────────────
@@ -209,7 +215,9 @@ run_bench() {
 
 # ── benchmarks ────────────────────────────────────────────────────────────────
 run_bench "moderate"   500  10   # baseline throughput
+sleep 1
 run_bench "burst"     1000  50   # high concurrency spike
+sleep 1
 run_bench "sustained" 2000  20   # sustained mixed load
 
 # ── verdict ───────────────────────────────────────────────────────────────────
