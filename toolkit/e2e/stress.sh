@@ -139,6 +139,7 @@ else  # ebpf
     ip netns exec "$POD_NS" ip link set veth-st-pod up
     ip netns exec "$POD_NS" ip addr add 10.101.0.2/24 dev veth-st-pod
     ip netns exec "$POD_NS" ip route add default via 10.101.0.1
+    ip netns exec "$POD_NS" sysctl -qw net.ipv4.tcp_tw_reuse=1
 
     AB_PREFIX=(ip netns exec "$POD_NS")
 fi
@@ -218,6 +219,22 @@ run_bench "moderate"   500  10   # baseline throughput
 sleep 1
 run_bench "burst"     1000  50   # high concurrency spike
 sleep 1
+
+# Verify interception is still working before the sustained run.
+if [[ "$MODE" == "ebpf" ]]; then
+    _chk=$(mktemp)
+    "${AB_PREFIX[@]}" ab -n 5 -c 1 -s 10 "$TARGET" >"$_chk" 2>&1 || true
+    if grep -q "Requests per second" "$_chk"; then
+        echo "[stress] ebpf intercept verified (pre-sustained)"
+    else
+        echo "[stress] WARNING: pre-sustained intercept check produced no summary:"
+        cat "$_chk"
+        echo "[stress] totan listener: $(ss -tlnH 'sport = :3129')"
+        echo "[stress] TIME_WAIT in pod: $(ip netns exec "$POD_NS" ss -an 2>/dev/null | grep -c TIME-WAIT || echo n/a)"
+    fi
+    rm -f "$_chk"
+fi
+
 run_bench "sustained" 2000  20   # sustained mixed load
 
 # ── verdict ───────────────────────────────────────────────────────────────────
