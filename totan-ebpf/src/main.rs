@@ -83,7 +83,7 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
 
     // Bail on IPv4 options (IHL > 5); the TcpHdr offset would shift and we'd
     // parse garbage. Standard HTTP/HTTPS traffic never carries IP options.
-    if (ipv4.ihl() as usize) * 4 != Ipv4Hdr::LEN {
+    if ipv4.ihl() as usize != Ipv4Hdr::LEN {
         return Ok(TC_ACT_OK as i32);
     }
 
