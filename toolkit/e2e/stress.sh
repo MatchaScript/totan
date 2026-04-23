@@ -62,7 +62,7 @@ cleanup() {
         ip rule del fwmark 0x7474 lookup 100 2>/dev/null
         ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
         ip netns del "$POD_NS" 2>/dev/null
-        ip link del veth-stress-host 2>/dev/null
+        ip link del veth-st-host 2>/dev/null
     fi
 
     if [[ "${_STRESS_PASS:-0}" == "1" ]]; then
@@ -108,7 +108,7 @@ client_idle_secs    = 30
 TOML
 
 if [[ "$MODE" == "ebpf" ]]; then
-    printf '[ebpf]\ningress_interface = "veth-stress-host"\n' >> "$TOTAN_CFG"
+    printf '[ebpf]\ningress_interface = "veth-st-host"\n' >> "$TOTAN_CFG"
 fi
 
 # ── interception setup ────────────────────────────────────────────────────────
@@ -128,15 +128,15 @@ else  # ebpf
     sysctl -qw net.ipv4.conf.all.rp_filter=0
 
     ip netns add "$POD_NS"
-    ip link add veth-stress-host type veth peer name veth-stress-pod
-    ip link set veth-stress-pod netns "$POD_NS"
-    ip link set veth-stress-host up
-    ip addr add 10.101.0.1/24 dev veth-stress-host
-    sysctl -qw net.ipv4.conf.veth-stress-host.rp_filter=0 2>/dev/null || true
+    ip link add veth-st-host type veth peer name veth-st-pod
+    ip link set veth-st-pod netns "$POD_NS"
+    ip link set veth-st-host up
+    ip addr add 10.101.0.1/24 dev veth-st-host
+    sysctl -qw net.ipv4.conf.veth-st-host.rp_filter=0 2>/dev/null || true
 
     ip netns exec "$POD_NS" ip link set lo up
-    ip netns exec "$POD_NS" ip link set veth-stress-pod up
-    ip netns exec "$POD_NS" ip addr add 10.101.0.2/24 dev veth-stress-pod
+    ip netns exec "$POD_NS" ip link set veth-st-pod up
+    ip netns exec "$POD_NS" ip addr add 10.101.0.2/24 dev veth-st-pod
     ip netns exec "$POD_NS" ip route add default via 10.101.0.1
 
     AB_PREFIX=(ip netns exec "$POD_NS")

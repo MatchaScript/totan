@@ -48,7 +48,9 @@ impl PacEngine {
     pub fn with_cache(self, ttl_secs: u64, max_entries: usize) -> Self {
         let mut guard = self.cache.lock().unwrap();
         guard.ttl = Duration::from_secs(ttl_secs);
-        guard.lru.resize(NonZeroUsize::new(max_entries.max(1)).unwrap());
+        guard
+            .lru
+            .resize(NonZeroUsize::new(max_entries.max(1)).unwrap());
         drop(guard);
         self
     }
@@ -90,52 +92,56 @@ impl PacEngine {
         let url_val = url.to_string();
         let host_val = host.to_string();
 
-        let join_result = timeout(self.pac_timeout, tokio::task::spawn_blocking(move || -> Result<String> {
-            let mut context = Context::default();
+        let join_result = timeout(
+            self.pac_timeout,
+            tokio::task::spawn_blocking(move || -> Result<String> {
+                let mut context = Context::default();
 
-            Self::register_helpers(&mut context)?;
+                Self::register_helpers(&mut context)?;
 
-            let source = Source::from_bytes(&script_content);
-            context.eval(source).map_err(|e| {
-                TotanError::PacScript(format!("PAC script evaluation failed: {}", e))
-            })?;
-
-            let find_proxy = context
-                .global_object()
-                .get(boa_engine::JsString::from("FindProxyForURL"), &mut context)
-                .map_err(|e| {
-                    TotanError::PacScript(format!("Failed to get FindProxyForURL: {}", e))
+                let source = Source::from_bytes(&script_content);
+                context.eval(source).map_err(|e| {
+                    TotanError::PacScript(format!("PAC script evaluation failed: {}", e))
                 })?;
 
-            if !find_proxy.is_callable() {
-                return Err(
-                    TotanError::PacScript("FindProxyForURL is not a function".to_string()).into(),
-                );
-            }
+                let find_proxy = context
+                    .global_object()
+                    .get(boa_engine::JsString::from("FindProxyForURL"), &mut context)
+                    .map_err(|e| {
+                        TotanError::PacScript(format!("Failed to get FindProxyForURL: {}", e))
+                    })?;
 
-            let args = [
-                boa_engine::value::JsValue::from(boa_engine::JsString::from(url_val)),
-                boa_engine::value::JsValue::from(boa_engine::JsString::from(host_val)),
-            ];
+                if !find_proxy.is_callable() {
+                    return Err(TotanError::PacScript(
+                        "FindProxyForURL is not a function".to_string(),
+                    )
+                    .into());
+                }
 
-            let result_val = find_proxy
-                .as_callable()
-                .unwrap()
-                .call(
-                    &boa_engine::value::JsValue::undefined(),
-                    &args,
-                    &mut context,
-                )
-                .map_err(|e| {
-                    TotanError::PacScript(format!("FindProxyForURL call failed: {}", e))
+                let args = [
+                    boa_engine::value::JsValue::from(boa_engine::JsString::from(url_val)),
+                    boa_engine::value::JsValue::from(boa_engine::JsString::from(host_val)),
+                ];
+
+                let result_val = find_proxy
+                    .as_callable()
+                    .unwrap()
+                    .call(
+                        &boa_engine::value::JsValue::undefined(),
+                        &args,
+                        &mut context,
+                    )
+                    .map_err(|e| {
+                        TotanError::PacScript(format!("FindProxyForURL call failed: {}", e))
+                    })?;
+
+                let result_str = result_val.to_string(&mut context).map_err(|e| {
+                    TotanError::PacScript(format!("Failed to convert PAC result to string: {}", e))
                 })?;
 
-            let result_str = result_val.to_string(&mut context).map_err(|e| {
-                TotanError::PacScript(format!("Failed to convert PAC result to string: {}", e))
-            })?;
-
-            Ok(result_str.to_std_string_escaped())
-        }))
+                Ok(result_str.to_std_string_escaped())
+            }),
+        )
         .await
         .map_err(|_| anyhow::anyhow!("PAC script execution timed out"))?;
         let result = join_result??;
@@ -367,9 +373,15 @@ mod tests {
         // Cloud collaboration → DIRECT (None)
         for (url, host) in [
             ("https://teams.microsoft.com/", "teams.microsoft.com"),
-            ("https://join.teams.microsoft.com/", "join.teams.microsoft.com"),
+            (
+                "https://join.teams.microsoft.com/",
+                "join.teams.microsoft.com",
+            ),
             ("https://contoso.sharepoint.com/", "contoso.sharepoint.com"),
-            ("https://login.microsoftonline.com/", "login.microsoftonline.com"),
+            (
+                "https://login.microsoftonline.com/",
+                "login.microsoftonline.com",
+            ),
             ("https://outlook.office365.com/", "outlook.office365.com"),
         ] {
             assert_eq!(
@@ -419,8 +431,16 @@ mod tests {
             ("https://example.au/", "example.au", "http://127.0.0.1:8882"),
             ("https://example.de/", "example.de", "http://127.0.0.1:8881"),
             ("https://example.fr/", "example.fr", "http://127.0.0.1:8881"),
-            ("https://example.com/", "example.com", "http://127.0.0.1:8880"),
-            ("https://example.org/", "example.org", "http://127.0.0.1:8880"),
+            (
+                "https://example.com/",
+                "example.com",
+                "http://127.0.0.1:8880",
+            ),
+            (
+                "https://example.org/",
+                "example.org",
+                "http://127.0.0.1:8880",
+            ),
         ];
         for (url, host, expected_proxy) in cases {
             assert_eq!(

@@ -273,7 +273,10 @@ async fn test_pac_direct_does_not_reach_proxy() {
 
     for (url, host) in [
         ("https://teams.microsoft.com/", "teams.microsoft.com"),
-        ("https://join.teams.microsoft.com/", "join.teams.microsoft.com"),
+        (
+            "https://join.teams.microsoft.com/",
+            "join.teams.microsoft.com",
+        ),
         ("https://outlook.office365.com/", "outlook.office365.com"),
     ] {
         assert_eq!(
