@@ -5,27 +5,42 @@ use tokio::net::TcpStream;
 use totan_common::{config::TotanConfig, InterceptedConnection, InterceptionMode};
 use tracing::debug;
 
-use crate::http_proxy::{serve_http_connection, HttpProxyContext};
 use crate::pac::PacEngine;
 use crate::upstream::UpstreamHandler;
 use crate::utils::extract_sni_hostname;
 
+enum ProxyResolver {
+    Pac(Arc<PacEngine>),
+    Fixed(Option<String>),
+}
+
+impl ProxyResolver {
+    async fn resolve(&self, url: &str, host: &str) -> Result<Option<String>> {
+        match self {
+            Self::Pac(engine) => engine.find_proxy_for_url(url, host).await,
+            Self::Fixed(proxy) => Ok(proxy.clone()),
+        }
+    }
+}
+
 pub struct ConnectionManager {
-    config: TotanConfig,
-    pac_engine: Option<Arc<PacEngine>>,
+    resolver: ProxyResolver,
     upstream_handler: UpstreamHandler,
 }
 
 impl ConnectionManager {
     pub async fn new(config: TotanConfig) -> Result<Self> {
-        // Initialize PAC engine if PAC file is specified
-        let pac_engine = if let Some(pac_file) = &config.pac_file {
+        // PAC takes precedence: if a PAC file is configured, default_proxy is
+        // ignored (PAC scripts encode their own DIRECT fallback). Without PAC,
+        // every connection is dispatched by the fixed default_proxy (or goes
+        // DIRECT when that is also None).
+        let resolver = if let Some(pac_file) = &config.pac_file {
             let engine = PacEngine::new(pac_file)
                 .await?
                 .with_cache(config.pac_cache_ttl_secs, config.pac_cache_max_entries);
-            Some(Arc::new(engine))
+            ProxyResolver::Pac(Arc::new(engine))
         } else {
-            None
+            ProxyResolver::Fixed(config.default_proxy.clone())
         };
 
         // SO_MARK on upstream sockets is only needed in netfilter mode: the
@@ -41,15 +56,13 @@ impl ConnectionManager {
         };
 
         let upstream_handler = UpstreamHandler::new(
-            config.default_proxy.clone(),
             config.timeouts.upstream_connect_ms,
             config.mitigation.clone(),
             upstream_mark,
         )?;
 
         Ok(Self {
-            config,
-            pac_engine,
+            resolver,
             upstream_handler,
         })
     }
@@ -109,45 +122,18 @@ impl ConnectionManager {
                 .unwrap_or_default()
         );
 
-        // Determine upstream proxy using PAC engine or default proxy
-        let upstream_proxy = if let Some(pac_engine) = &self.pac_engine {
-            pac_engine
-                .find_proxy_for_url(&target_url, &hostname_for_url)
-                .await?
-        } else {
-            self.config.default_proxy.clone()
-        };
+        let upstream_proxy = self
+            .resolver
+            .resolve(&target_url, &hostname_for_url)
+            .await?;
 
         match &upstream_proxy {
             Some(p) => debug!("Upstream route: PROXY {}", p),
             None => debug!("Upstream route: DIRECT"),
         }
 
-        // Experimental Pingora-based HTTP pipeline branch (plain HTTP only)
-        if self.config.experimental_hyper_http && upstream_proxy.is_some() {
-            if let Some(proxy_url) = &upstream_proxy {
-                match HttpProxyContext::new(intercepted_conn.clone(), proxy_url) {
-                    Ok(ctx) => {
-                        return serve_http_connection(stream, ctx).await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to init Pingora HTTP context: {} (falling back to legacy path)",
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        // Handle the connection through upstream handler
         self.upstream_handler
-            .handle_connection(
-                intercepted_conn,
-                stream,
-                upstream_proxy,
-                self.pac_engine.is_none(),
-            )
+            .handle_connection(intercepted_conn, stream, upstream_proxy)
             .await
     }
 }

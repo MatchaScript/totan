@@ -35,95 +35,12 @@ async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
     (server_side.unwrap().0, client_side.unwrap())
 }
 
-// ── handle_http_proxy_impl level (duplex) ─────────────────────────────────────
-
-#[tokio::test]
-async fn test_proxy_flow_simulated() {
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = proxy_listener.local_addr().unwrap();
-    let proxy_url = format!("http://{}", proxy_addr);
-
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = proxy_listener.accept().await {
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).await.unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]);
-            if req.contains("GET http://example.com/ HTTP/1.1") {
-                let _ = stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nHELO")
-                    .await;
-            }
-            let _ = stream.shutdown().await;
-        }
-    });
-
-    let handler = totan::upstream::UpstreamHandler::new(
-        Some(proxy_url),
-        1000,
-        ErrorMitigationConfig::default(),
-        0,
-    )
-    .unwrap();
-
-    let (mut client, mut client_mock) = tokio::io::duplex(1024);
-    let (mut upstream, _upstream_mock) = tokio::io::duplex(1024);
-
-    tokio::spawn(async move {
-        let _ = client_mock
-            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
-            .await;
-        let mut buf = [0u8; 1024];
-        let n = client_mock.read(&mut buf).await.unwrap_or(0);
-        let resp = String::from_utf8_lossy(&buf[..n]);
-        assert!(resp.contains("HELO"));
-        let _ = client_mock.shutdown().await;
-    });
-
-    let _ = tokio::time::timeout(
-        Duration::from_millis(200),
-        handler.handle_http_proxy_impl::<tokio::io::DuplexStream, tokio::io::DuplexStream>(
-            http_conn(),
-            &mut client,
-            &mut upstream,
-        ),
-    )
-    .await;
-}
+// ── protocol-level duplex tests ───────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_socks5_flow_simulated() {
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = proxy_listener.local_addr().unwrap();
-    let proxy_url = format!("socks5://{}", proxy_addr);
-
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = proxy_listener.accept().await {
-            let mut buf = [0u8; 3];
-            let _ = stream.read_exact(&mut buf).await;
-            let _ = stream.write_all(&[0x05, 0x00]).await;
-
-            let mut buf = [0u8; 12];
-            let _ = stream.read_exact(&mut buf).await;
-            let _ = stream
-                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
-                .await;
-
-            let mut buf = [0u8; 4];
-            let _ = stream.read_exact(&mut buf).await;
-            if &buf == b"PING" {
-                let _ = stream.write_all(b"PONG").await;
-            }
-            let _ = stream.shutdown().await;
-        }
-    });
-
-    let handler = totan::upstream::UpstreamHandler::new(
-        Some(proxy_url),
-        1000,
-        ErrorMitigationConfig::default(),
-        0,
-    )
-    .unwrap();
+    let handler =
+        totan::upstream::UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
 
     let (mut client, mut client_mock) = tokio::io::duplex(1024);
     let (mut upstream, _upstream_mock) = tokio::io::duplex(1024);
@@ -176,19 +93,14 @@ async fn test_handle_connection_https_407_is_error() {
     });
 
     let proxy_url = format!("http://{}", proxy_addr);
-    let handler = totan::upstream::UpstreamHandler::new(
-        Some(proxy_url),
-        1000,
-        ErrorMitigationConfig::default(),
-        0,
-    )
-    .unwrap();
+    let handler =
+        totan::upstream::UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
 
     let (totan_side, _test_client) = tcp_pair().await;
 
     let result = tokio::time::timeout(
         Duration::from_millis(500),
-        handler.handle_connection(tls_conn("example.com"), totan_side, None, true),
+        handler.handle_connection(tls_conn("example.com"), totan_side, Some(proxy_url)),
     )
     .await
     .expect("timed out waiting for 407 handling");
@@ -217,13 +129,8 @@ async fn test_handle_connection_http_end_to_end() {
     });
 
     let proxy_url = format!("http://{}", proxy_addr);
-    let handler = totan::upstream::UpstreamHandler::new(
-        Some(proxy_url),
-        1000,
-        ErrorMitigationConfig::default(),
-        0,
-    )
-    .unwrap();
+    let handler =
+        totan::upstream::UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
 
     let (totan_side, mut test_client) = tcp_pair().await;
 
@@ -242,7 +149,7 @@ async fn test_handle_connection_http_end_to_end() {
 
     let result = tokio::time::timeout(
         Duration::from_millis(500),
-        handler.handle_connection(http_conn(), totan_side, None, true),
+        handler.handle_connection(http_conn(), totan_side, Some(proxy_url)),
     )
     .await
     .expect("timed out");

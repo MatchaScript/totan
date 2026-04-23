@@ -20,11 +20,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting totan transparent proxy");
     info!("Configuration loaded successfully");
-    if config.experimental_hyper_http {
-        info!("Experimental Pingora HTTP pipeline: ENABLED");
-    } else {
-        info!("Experimental Pingora HTTP pipeline: disabled");
-    }
 
     // Create packet interceptor based on mode
     let mode = config.interception_mode;

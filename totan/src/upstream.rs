@@ -1,3 +1,4 @@
+use crate::http_proxy::{serve_http_connection, HttpProxyContext};
 use crate::utils::tolerant_copy_bidirectional;
 use anyhow::Result;
 use std::net::SocketAddr;
@@ -10,7 +11,6 @@ use tracing::{debug, warn};
 use url::Url;
 
 pub struct UpstreamHandler {
-    default_proxy: Option<String>,
     connect_timeout: Duration,
     mitigation: ErrorMitigationConfig,
     upstream_mark: u32,
@@ -18,13 +18,11 @@ pub struct UpstreamHandler {
 
 impl UpstreamHandler {
     pub fn new(
-        default_proxy: Option<String>,
         connect_timeout_ms: u64,
         mitigation: ErrorMitigationConfig,
         upstream_mark: u32,
     ) -> Result<Self> {
         Ok(Self {
-            default_proxy,
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             mitigation,
             upstream_mark,
@@ -36,17 +34,8 @@ impl UpstreamHandler {
         intercepted_conn: InterceptedConnection,
         client_stream: TcpStream,
         upstream_proxy: Option<String>,
-        allow_default_fallback: bool,
     ) -> Result<()> {
-        let proxy_url = if upstream_proxy.is_some() {
-            upstream_proxy
-        } else if allow_default_fallback {
-            self.default_proxy.clone()
-        } else {
-            None
-        };
-
-        match proxy_url {
+        match upstream_proxy {
             Some(proxy) => {
                 self.handle_proxy_connection(intercepted_conn, client_stream, proxy)
                     .await
@@ -66,6 +55,15 @@ impl UpstreamHandler {
     ) -> Result<()> {
         let url = Url::parse(&proxy_url)
             .map_err(|e| TotanError::Config(format!("Invalid proxy URL '{}': {}", proxy_url, e)))?;
+
+        // Plain HTTP through an HTTP proxy: Pingora owns the end-to-end
+        // HTTP semantics (absolute-form rewriting, keep-alive, per-request
+        // forwarding). TLS (CONNECT) and SOCKS5 stay on the tunneled path
+        // below because they are opaque byte pipes after a short handshake.
+        if url.scheme() == "http" && intercepted_conn.original_dest.port() != 443 {
+            let ctx = HttpProxyContext::new(intercepted_conn, &proxy_url, self.upstream_mark)?;
+            return serve_http_connection(client_stream, ctx).await;
+        }
 
         let proxy_addr = format!(
             "{}:{}",
@@ -145,8 +143,9 @@ impl UpstreamHandler {
         let _ = client_stream.set_nodelay(true);
 
         match url.scheme() {
+            // Only reached with target port 443 — plain HTTP was diverted to Pingora above.
             "http" => {
-                self.handle_http_proxy(intercepted_conn, client_stream, upstream_stream)
+                self.handle_https_connect(intercepted_conn, client_stream, upstream_stream)
                     .await
             }
             "socks5" => {
@@ -232,17 +231,17 @@ impl UpstreamHandler {
         Ok(())
     }
 
-    async fn handle_http_proxy(
+    async fn handle_https_connect(
         &self,
         intercepted_conn: InterceptedConnection,
         mut client_stream: TcpStream,
         mut upstream_stream: TcpStream,
     ) -> Result<()> {
-        self.handle_http_proxy_impl(intercepted_conn, &mut client_stream, &mut upstream_stream)
+        self.handle_https_connect_impl(intercepted_conn, &mut client_stream, &mut upstream_stream)
             .await
     }
 
-    pub async fn handle_http_proxy_impl<C, U>(
+    pub async fn handle_https_connect_impl<C, U>(
         &self,
         intercepted_conn: InterceptedConnection,
         client_stream: &mut C,
@@ -252,79 +251,52 @@ impl UpstreamHandler {
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
         U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        // Reduce small-packet latency is done by caller on real TcpStream
-
-        // Use CONNECT only for TLS targets (port 443). For plain HTTP, skip CONNECT and
-        // send absolute-form requests directly to the proxy to avoid 403s and extra round trips.
-        let is_tls = intercepted_conn.original_dest.port() == 443;
-        if is_tls {
-            let authority_host = intercepted_conn
-                .sni_hostname
-                .clone()
-                .unwrap_or_else(|| intercepted_conn.original_dest.ip().to_string());
-            let authority = format!(
-                "{}:{}",
-                authority_host,
-                intercepted_conn.original_dest.port()
-            );
-            debug!("HTTP proxy CONNECT to {}", authority);
-            let connect_request = format!(
-                "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n",
-                authority,
-                authority
-            );
-            upstream_stream
-                .write_all(connect_request.as_bytes())
-                .await?;
-            // Read until \r\n\r\n so TCP-split responses are handled correctly.
-            let mut response = Vec::with_capacity(256);
-            let mut byte = [0u8; 1];
-            loop {
-                upstream_stream.read_exact(&mut byte).await.map_err(|e| {
-                    TotanError::UpstreamProxy(format!("Failed reading CONNECT response: {}", e))
-                })?;
-                response.push(byte[0]);
-                if response.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-                if response.len() > 8192 {
-                    return Err(TotanError::UpstreamProxy(
-                        "CONNECT response too large".to_string(),
-                    )
-                    .into());
-                }
+        let authority_host = intercepted_conn
+            .sni_hostname
+            .clone()
+            .unwrap_or_else(|| intercepted_conn.original_dest.ip().to_string());
+        let authority = format!(
+            "{}:{}",
+            authority_host,
+            intercepted_conn.original_dest.port()
+        );
+        debug!("HTTP proxy CONNECT to {}", authority);
+        let connect_request = format!(
+            "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n",
+            authority, authority
+        );
+        upstream_stream
+            .write_all(connect_request.as_bytes())
+            .await?;
+        // Read until \r\n\r\n so TCP-split responses are handled correctly.
+        let mut response = Vec::with_capacity(256);
+        let mut byte = [0u8; 1];
+        loop {
+            upstream_stream.read_exact(&mut byte).await.map_err(|e| {
+                TotanError::UpstreamProxy(format!("Failed reading CONNECT response: {}", e))
+            })?;
+            response.push(byte[0]);
+            if response.ends_with(b"\r\n\r\n") {
+                break;
             }
-            let response_str = String::from_utf8_lossy(&response);
-            if response_str.starts_with("HTTP/1.1 200") || response_str.starts_with("HTTP/1.0 200")
-            {
-                debug!("HTTP proxy CONNECT successful");
-                // Tunnel data once CONNECT succeeds
-                let _ = tolerant_copy_bidirectional(client_stream, upstream_stream).await;
-                Ok(())
-            } else {
-                warn!(
-                    "HTTP proxy CONNECT rejected: {}",
-                    response_str.lines().next().unwrap_or("").trim()
+            if response.len() > 8192 {
+                return Err(
+                    TotanError::UpstreamProxy("CONNECT response too large".to_string()).into(),
                 );
-                self.send_rst_and_close_generic(client_stream).await;
-                Err(
-                    TotanError::UpstreamProxy("HTTP proxy CONNECT request failed".to_string())
-                        .into(),
-                )
             }
-        } else {
-            // Plain HTTP: rewrite origin-form to absolute-form and forward.
-            if let Err(e) = self
-                .rewrite_and_forward_http_request(client_stream, upstream_stream, &intercepted_conn)
-                .await
-            {
-                warn!("Failed to rewrite HTTP request: {}", e);
-                self.send_rst_and_close_generic(client_stream).await;
-                return Err(e);
-            }
-            // After forwarding the first request, continue tunneling the rest.
+        }
+        let response_str = String::from_utf8_lossy(&response);
+        if response_str.starts_with("HTTP/1.1 200") || response_str.starts_with("HTTP/1.0 200") {
+            debug!("HTTP proxy CONNECT successful");
             let _ = tolerant_copy_bidirectional(client_stream, upstream_stream).await;
             Ok(())
+        } else {
+            warn!(
+                "HTTP proxy CONNECT rejected: {}",
+                response_str.lines().next().unwrap_or("").trim()
+            );
+            self.send_rst_and_close_generic(client_stream).await;
+            Err(TotanError::UpstreamProxy("HTTP proxy CONNECT request failed".to_string()).into())
         }
     }
 
@@ -481,164 +453,6 @@ impl UpstreamHandler {
         // For generic streams (like mocks), just shutdown
         let _ = stream.shutdown().await;
     }
-
-    // Read the first HTTP request from client, rewrite origin-form to absolute-form,
-    // preserve keep-alive semantics, and forward it to the upstream HTTP proxy.
-    // Any already-read body bytes are forwarded too.
-    async fn rewrite_and_forward_http_request<C, U>(
-        &self,
-        client_stream: &mut C,
-        upstream_stream: &mut U,
-        intercepted_conn: &InterceptedConnection,
-    ) -> Result<()>
-    where
-        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-        U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    {
-        // Read until end of headers (\r\n\r\n), with a safety cap
-        let mut buf: Vec<u8> = Vec::with_capacity(8192);
-        let mut tmp = [0u8; 4096];
-        let mut header_end: Option<usize> = None;
-        const MAX_HEADER_SIZE: usize = 64 * 1024; // 64KB
-
-        while header_end.is_none() {
-            let n = client_stream.read(&mut tmp).await?;
-            if n == 0 {
-                return Err(TotanError::Network(
-                    "Client closed before sending HTTP headers".to_string(),
-                )
-                .into());
-            }
-            buf.extend_from_slice(&tmp[..n]);
-            if buf.len() > MAX_HEADER_SIZE {
-                return Err(TotanError::Network("HTTP header too large".to_string()).into());
-            }
-            // search for \r\n\r\n
-            let mut i = 3; // minimum index where we can look back 3 bytes
-            while i < buf.len() {
-                if buf[i] == b'\n'
-                    && i >= 3
-                    && buf[i - 1] == b'\r'
-                    && buf[i - 2] == b'\n'
-                    && buf[i - 3] == b'\r'
-                {
-                    header_end = Some(i + 1);
-                    break;
-                }
-                i += 1;
-            }
-        }
-        let headers_end = header_end.unwrap();
-        let (headers_bytes, rest) = buf.split_at(headers_end);
-        let headers_str = String::from_utf8_lossy(headers_bytes);
-        let mut lines = headers_str.split("\r\n");
-        let request_line = lines.next().unwrap_or("");
-        let mut parts = request_line.splitn(3, ' ');
-        let method = parts.next().unwrap_or("");
-        let target = parts.next().unwrap_or("");
-        let version = parts.next().unwrap_or("");
-
-        // Collect headers, track Host/Connection presence
-        let mut host_header: Option<String> = None;
-        let mut connection_header: Option<String> = None; // original value as sent by client
-        let mut proxy_connection_header: Option<String> = None; // original value if present
-        let mut other_headers: Vec<String> = Vec::new();
-        for line in lines {
-            if line.is_empty() {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                let name_trim = name.trim();
-                let value_trim = value.trim();
-                if name_trim.eq_ignore_ascii_case("Host") {
-                    host_header = Some(value_trim.to_string());
-                } else if name_trim.eq_ignore_ascii_case("Connection") {
-                    connection_header = Some(value_trim.to_string());
-                    // Preserve client's Connection header
-                    other_headers.push(format!("Connection: {}", value_trim));
-                } else if name_trim.eq_ignore_ascii_case("Proxy-Connection") {
-                    // Preserve original; we'll also set one if needed
-                    proxy_connection_header = Some(value_trim.to_string());
-                    other_headers.push(format!("Proxy-Connection: {}", value_trim));
-                } else {
-                    other_headers.push(format!("{}: {}", name_trim, value_trim));
-                }
-            } else {
-                // malformed header line, pass through as-is
-                other_headers.push(line.to_string());
-            }
-        }
-
-        // Determine host to use
-        let host_for_abs = if let Some(h) = host_header.clone() {
-            h
-        } else {
-            // Fallback to original destination host:port
-            let host = intercepted_conn.original_dest.ip().to_string();
-            let port = intercepted_conn.original_dest.port();
-            if port == 80 {
-                host
-            } else {
-                format!("{}:{}", host, port)
-            }
-        };
-
-        let absolute_target_needed = target.starts_with('/') || target.starts_with("*");
-        let (new_request_line, debug_url): (String, String) = if absolute_target_needed {
-            let url = format!(
-                "http://{}{}",
-                host_for_abs,
-                if target.starts_with('/') { target } else { "/" }
-            );
-            (format!("{} {} {}\r\n", method, url, version), url)
-        } else {
-            // already absolute or authority-form; keep as-is
-            (
-                format!("{} {} {}\r\n", method, target, version),
-                target.to_string(),
-            )
-        };
-        debug!("HTTP request: {} {}", method, debug_url);
-
-        // Build final headers
-        let mut rewritten = Vec::with_capacity(headers_bytes.len() + 64);
-        rewritten.extend_from_slice(new_request_line.as_bytes());
-        // Ensure Host header present (and keep/normalize it)
-        let host_value = host_header.unwrap_or_else(|| host_for_abs.clone());
-        rewritten.extend_from_slice(format!("Host: {}\r\n", host_value).as_bytes());
-        for h in &other_headers {
-            rewritten.extend_from_slice(h.as_bytes());
-            rewritten.extend_from_slice(b"\r\n");
-        }
-        // If no Proxy-Connection was present, add a helpful one based on client's intent
-        if proxy_connection_header.is_none() {
-            // Determine desired persistence
-            let wants_keep_alive = match connection_header.as_deref() {
-                Some(v) if v.eq_ignore_ascii_case("keep-alive") => true,
-                // HTTP/1.1 defaults to persistent connections
-                None if version.eq_ignore_ascii_case("HTTP/1.1") => true,
-                _ => false,
-            };
-            if wants_keep_alive {
-                rewritten.extend_from_slice(b"Proxy-Connection: keep-alive\r\n");
-            } else if matches!(connection_header.as_deref(), Some(v) if v.eq_ignore_ascii_case("close"))
-            {
-                rewritten.extend_from_slice(b"Proxy-Connection: close\r\n");
-            }
-        }
-        // End of headers
-        rewritten.extend_from_slice(b"\r\n");
-
-        // Write to upstream
-        upstream_stream.write_all(&rewritten).await?;
-        // Forward any already-read body bytes
-        if !rest.is_empty() {
-            upstream_stream.write_all(rest).await?;
-        }
-        upstream_stream.flush().await?;
-
-        Ok(())
-    }
 }
 
 /// Connect to `addr` with optional `SO_MARK`. Resolves hostnames and tries
@@ -689,38 +503,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rewrite_http_request() {
-        let handler =
-            UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
-        let (mut client, mut client_mock) = tokio::io::duplex(1024);
-        let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
-
-        let conn = test_conn();
-
-        tokio::spawn(async move {
-            client_mock
-                .write_all(b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n")
-                .await
-                .unwrap();
-        });
-
-        handler
-            .rewrite_and_forward_http_request(&mut client, &mut upstream, &conn)
-            .await
-            .unwrap();
-
-        let mut buf = [0u8; 1024];
-        let n = upstream_mock.read(&mut buf).await.unwrap();
-        let request = String::from_utf8_lossy(&buf[..n]);
-
-        assert!(request.contains("GET http://example.com/index.html HTTP/1.1"));
-        assert!(request.contains("Host: example.com"));
-    }
-
-    #[tokio::test]
-    async fn test_handle_http_proxy_connect() {
-        let handler =
-            UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
+    async fn test_handle_https_connect() {
+        let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, _client_mock) = tokio::io::duplex(1024);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
@@ -744,15 +528,14 @@ mod tests {
         // Use a timeout to prevent hanging forever
         let _ = tokio::time::timeout(
             Duration::from_millis(100),
-            handler.handle_http_proxy_impl(conn, &mut client, &mut upstream),
+            handler.handle_https_connect_impl(conn, &mut client, &mut upstream),
         )
         .await;
     }
 
     #[tokio::test]
     async fn test_handle_socks5_proxy_connect() {
-        let handler =
-            UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, _client_mock) = tokio::io::duplex(1024);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
@@ -803,8 +586,7 @@ mod tests {
     /// copy_bidirectional without discarding or leaking any bytes.
     #[tokio::test]
     async fn test_connect_response_with_extra_headers() {
-        let handler =
-            UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, client_mock) = tokio::io::duplex(4096);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
@@ -837,7 +619,7 @@ mod tests {
         // Should succeed: 200 response even with extra headers and TCP split.
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            handler.handle_http_proxy_impl(conn, &mut client, &mut upstream),
+            handler.handle_https_connect_impl(conn, &mut client, &mut upstream),
         )
         .await;
         assert!(result.is_ok(), "timed out waiting for CONNECT to complete");
@@ -847,8 +629,7 @@ mod tests {
     /// an error and not attempt to tunnel into the 407 response body.
     #[tokio::test]
     async fn test_connect_rejected_407() {
-        let handler =
-            UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, _client_mock) = tokio::io::duplex(4096);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
@@ -872,7 +653,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            handler.handle_http_proxy_impl(conn, &mut client, &mut upstream),
+            handler.handle_https_connect_impl(conn, &mut client, &mut upstream),
         )
         .await
         .expect("timed out");
@@ -884,8 +665,7 @@ mod tests {
     /// 403 Forbidden when the target is not in the allow-list.
     #[tokio::test]
     async fn test_connect_rejected_403() {
-        let handler =
-            UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, _client_mock) = tokio::io::duplex(4096);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
@@ -905,7 +685,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            handler.handle_http_proxy_impl(conn, &mut client, &mut upstream),
+            handler.handle_https_connect_impl(conn, &mut client, &mut upstream),
         )
         .await
         .expect("timed out");

@@ -49,10 +49,6 @@ pub struct TotanConfig {
     /// eBPF-specific configuration (only consulted when `interception_mode = "ebpf"`)
     #[serde(default)]
     pub ebpf: EbpfConfig,
-
-    /// Experimental: enable Pingora-based HTTP proxy pipeline (absolute-form for all requests)
-    #[serde(default)]
-    pub experimental_hyper_http: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,7 +164,6 @@ impl Default for TotanConfig {
             mitigation: Default::default(),
             netfilter: Default::default(),
             ebpf: Default::default(),
-            experimental_hyper_http: false,
         }
     }
 }
