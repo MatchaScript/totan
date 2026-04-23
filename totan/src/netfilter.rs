@@ -1,9 +1,11 @@
 //! Automatic nftables rule management for netfilter interception mode.
 //!
 //! [`NetfilterManager::setup`] installs a `table ip totan` with an OUTPUT
-//! nat hook that redirects **all** outbound TCP traffic on the configured
-//! ports to totan's listener, excluding totan's own UID (auto-detected) to
-//! prevent redirect loops and any additional UIDs listed in `exclude_uids`.
+//! nat hook that redirects outbound TCP traffic on the configured ports to
+//! totan's listener. Packets already marked with `cfg.fwmark` via `SO_MARK`
+//! (set on totan's own upstream sockets) are returned early, preventing
+//! redirect loops regardless of which user the process runs as. RFC-1918 and
+//! loopback destinations are also excluded.
 //!
 //! Rules are removed when [`NetfilterManager`] is dropped, so Ctrl-C or a
 //! normal process exit always leaves the system clean.
@@ -18,6 +20,9 @@ use totan_common::config::NetfilterConfig;
 
 const TABLE: &str = "totan";
 
+const PRIVATE_NETS: &str =
+    "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16";
+
 /// RAII guard that installs nftables rules on construction and removes them
 /// on drop.
 pub struct NetfilterManager;
@@ -31,18 +36,7 @@ impl NetfilterManager {
             return Ok(None);
         }
 
-        let own_uid = nix::unistd::getuid().as_raw();
-
-        // Build the exclude set: totan's own UID + any user-specified UIDs.
-        let mut excluded: Vec<u32> = vec![own_uid];
-        excluded.extend_from_slice(&cfg.exclude_uids);
-        excluded.dedup();
-        let exclude_set = excluded
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-
+        let fwmark = cfg.fwmark;
         let port_set = cfg
             .redirect_ports
             .iter()
@@ -57,18 +51,18 @@ impl NetfilterManager {
             "table ip {TABLE} {{\
              \n\tchain output {{\
              \n\t\ttype nat hook output priority -100; policy accept;\
-             \n\t\tmeta skuid {{ {exclude_set} }} return\
+             \n\t\tmeta mark {fwmark:#010x} return\
+             \n\t\tip daddr {{ {PRIVATE_NETS} }} return\
              \n\t\ttcp dport {{ {port_set} }} redirect to :{listen_port}\
              \n\t}}\
              \n}}"
         ))?;
 
         info!(
-            own_uid,
-            exclude_uids = ?excluded,
+            fwmark,
             ports = ?cfg.redirect_ports,
             listen_port,
-            "nftables redirect rules installed (all traffic except excluded UIDs)"
+            "nftables redirect rules installed"
         );
         Ok(Some(Self))
     }

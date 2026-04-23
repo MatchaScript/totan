@@ -1,5 +1,6 @@
 use crate::utils::tolerant_copy_bidirectional;
 use anyhow::Result;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -12,6 +13,7 @@ pub struct UpstreamHandler {
     default_proxy: Option<String>,
     connect_timeout: Duration,
     mitigation: ErrorMitigationConfig,
+    upstream_mark: u32,
 }
 
 impl UpstreamHandler {
@@ -19,11 +21,13 @@ impl UpstreamHandler {
         default_proxy: Option<String>,
         connect_timeout_ms: u64,
         mitigation: ErrorMitigationConfig,
+        upstream_mark: u32,
     ) -> Result<Self> {
         Ok(Self {
             default_proxy,
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             mitigation,
+            upstream_mark,
         })
     }
 
@@ -79,7 +83,12 @@ impl UpstreamHandler {
         let max_attempts = self.mitigation.retry_attempts.saturating_add(1);
         let mut upstream_stream_opt: Option<TcpStream> = None;
         loop {
-            match timeout(self.connect_timeout, TcpStream::connect(&proxy_addr)).await {
+            match timeout(
+                self.connect_timeout,
+                tcp_connect_marked(&proxy_addr, self.upstream_mark),
+            )
+            .await
+            {
                 Ok(Ok(stream)) => {
                     upstream_stream_opt = Some(stream);
                     break;
@@ -167,7 +176,7 @@ impl UpstreamHandler {
         loop {
             match timeout(
                 self.connect_timeout,
-                TcpStream::connect(intercepted_conn.original_dest),
+                tcp_connect_marked(intercepted_conn.original_dest, self.upstream_mark),
             )
             .await
             {
@@ -632,6 +641,37 @@ impl UpstreamHandler {
     }
 }
 
+/// Connect to `addr` with optional `SO_MARK`. Resolves hostnames and tries
+/// each resulting address in turn, returning the first successful connection.
+/// When `mark` is zero the socket is created without marking.
+async fn tcp_connect_marked<A: tokio::net::ToSocketAddrs>(
+    addr: A,
+    mark: u32,
+) -> std::io::Result<TcpStream> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use tokio::net::TcpSocket;
+
+    let mut last_err =
+        std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "no addresses resolved");
+    for socket_addr in tokio::net::lookup_host(addr).await? {
+        let domain = match socket_addr {
+            SocketAddr::V4(_) => Domain::IPV4,
+            SocketAddr::V6(_) => Domain::IPV6,
+        };
+        let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        if mark != 0 {
+            sock.set_mark(mark)?;
+        }
+        sock.set_nonblocking(true)?;
+        let tcp_socket = TcpSocket::from_std_stream(std::net::TcpStream::from(sock));
+        match tcp_socket.connect(socket_addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,7 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rewrite_http_request() {
-        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default()).unwrap();
+        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, mut client_mock) = tokio::io::duplex(1024);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
@@ -676,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_http_proxy_connect() {
-        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default()).unwrap();
+        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, _client_mock) = tokio::io::duplex(1024);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
@@ -707,7 +747,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_socks5_proxy_connect() {
-        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default()).unwrap();
+        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, _client_mock) = tokio::io::duplex(1024);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
@@ -758,7 +798,7 @@ mod tests {
     /// copy_bidirectional without discarding or leaking any bytes.
     #[tokio::test]
     async fn test_connect_response_with_extra_headers() {
-        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default()).unwrap();
+        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, client_mock) = tokio::io::duplex(4096);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
@@ -801,7 +841,7 @@ mod tests {
     /// an error and not attempt to tunnel into the 407 response body.
     #[tokio::test]
     async fn test_connect_rejected_407() {
-        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default()).unwrap();
+        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, _client_mock) = tokio::io::duplex(4096);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
@@ -837,7 +877,7 @@ mod tests {
     /// 403 Forbidden when the target is not in the allow-list.
     #[tokio::test]
     async fn test_connect_rejected_403() {
-        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default()).unwrap();
+        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, _client_mock) = tokio::io::duplex(4096);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 

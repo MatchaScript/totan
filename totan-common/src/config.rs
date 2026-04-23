@@ -57,11 +57,16 @@ pub struct TotanConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EbpfConfig {
-    /// Host-side interface carrying traffic *from* clients we want to intercept
-    /// (e.g. the host-peer of a pod's veth or netkit). The tc ingress classifier
-    /// is attached here. Required when `interception_mode = "ebpf"`.
+    /// Interface names or glob patterns (supports `*` and `?`) for the
+    /// host-side peers of client network devices (veth / netkit). The tc
+    /// ingress classifier is attached to every matching interface at startup,
+    /// and newly-appearing interfaces that match are picked up automatically.
+    ///
+    /// Examples:
+    ///   `["lxc*"]`        — all Cilium pod veth pairs
+    ///   `["eth0", "ens*"]` — specific + wildcard
     #[serde(default)]
-    pub ingress_interface: Option<String>,
+    pub ingress_interfaces: Vec<String>,
 
     /// Localhost TPROXY listener port. The tc ingress program assigns matching
     /// flows to the listener at `127.0.0.1:<tproxy_port>` via `bpf_sk_assign`.
@@ -86,7 +91,7 @@ fn default_fwmark() -> u32 {
 impl Default for EbpfConfig {
     fn default() -> Self {
         Self {
-            ingress_interface: None,
+            ingress_interfaces: Vec::new(),
             tproxy_port: None,
             fwmark: default_fwmark(),
         }
@@ -169,25 +174,39 @@ impl Default for TotanConfig {
 }
 
 /// Netfilter-mode rule management configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetfilterConfig {
-    /// When `true`, totan installs nftables OUTPUT rules that redirect **all**
-    /// outbound TCP traffic on `redirect_ports` to its listener, automatically
-    /// excluding its own UID to prevent redirect loops.
+    /// When `true`, totan installs nftables OUTPUT rules that redirect all
+    /// outbound TCP traffic on `redirect_ports` to its listener. Packets marked
+    /// with `fwmark` (set on totan's own upstream sockets via `SO_MARK`) are
+    /// excluded to prevent redirect loops — this works regardless of the
+    /// running user.
     ///
     /// When `false` (default), totan does not touch nftables — manage rules
     /// externally (e.g. via a system nftables config or Ansible).
     #[serde(default)]
     pub manage_rules: bool,
 
-    /// Additional UIDs to exclude from redirection (e.g. system daemons that
-    /// must bypass the proxy). totan's own UID is always excluded automatically.
-    #[serde(default)]
-    pub exclude_uids: Vec<u32>,
+    /// Socket mark (`SO_MARK`) applied to totan's own upstream TCP connections
+    /// and matched by `meta mark` in the nftables rule to prevent redirect
+    /// loops. Must not overlap with Cilium's mark range (0x0200–0x0E00).
+    /// Default: 0x7474.
+    #[serde(default = "default_fwmark")]
+    pub fwmark: u32,
 
     /// TCP destination ports to intercept. Default: [80, 443].
     #[serde(default = "default_redirect_ports")]
     pub redirect_ports: Vec<u16>,
+}
+
+impl Default for NetfilterConfig {
+    fn default() -> Self {
+        Self {
+            manage_rules: false,
+            fwmark: default_fwmark(),
+            redirect_ports: default_redirect_ports(),
+        }
+    }
 }
 
 fn default_redirect_ports() -> Vec<u16> {

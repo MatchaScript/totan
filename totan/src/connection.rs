@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use totan_common::{config::TotanConfig, InterceptedConnection};
+use totan_common::{config::TotanConfig, InterceptedConnection, InterceptionMode};
 use tracing::debug;
 
 use crate::http_proxy::{serve_http_connection, HttpProxyContext};
@@ -28,10 +28,23 @@ impl ConnectionManager {
             None
         };
 
+        // SO_MARK on upstream sockets is only needed in netfilter mode: the
+        // OUTPUT hook would otherwise re-intercept the proxy's own connections.
+        // In eBPF mode the interception is on ingress (tc hook), so upstream
+        // connections are never redirected — and using the eBPF fwmark here
+        // would accidentally match the policy-routing rule and route packets
+        // to loopback.
+        let upstream_mark = match config.interception_mode {
+            InterceptionMode::Netfilter => config.netfilter.fwmark,
+            #[cfg(feature = "ebpf")]
+            InterceptionMode::Ebpf => 0,
+        };
+
         let upstream_handler = UpstreamHandler::new(
             config.default_proxy.clone(),
             config.timeouts.upstream_connect_ms,
             config.mitigation.clone(),
+            upstream_mark,
         )?;
 
         Ok(Self {
