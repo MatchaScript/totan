@@ -25,6 +25,13 @@ impl PacketInterceptor {
     }
 
     async fn run_netfilter(self, connection_manager: Arc<ConnectionManager>) -> Result<()> {
+        // Install nftables rules when redirect_uids is configured; the RAII
+        // guard removes them on drop (clean shutdown or panic unwind).
+        let _nft = crate::netfilter::NetfilterManager::setup(
+            self.config.listen_port,
+            &self.config.netfilter,
+        )?;
+
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.config.listen_port)).await?;
         info!(
             "Netfilter interceptor listening on port {}",

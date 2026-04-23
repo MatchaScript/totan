@@ -37,6 +37,10 @@ pub struct TotanConfig {
     #[serde(default)]
     pub mitigation: ErrorMitigationConfig,
 
+    /// Netfilter-specific configuration (only consulted when `interception_mode = "netfilter"`)
+    #[serde(default)]
+    pub netfilter: NetfilterConfig,
+
     /// eBPF-specific configuration (only consulted when `interception_mode = "ebpf"`)
     #[serde(default)]
     pub ebpf: EbpfConfig,
@@ -152,10 +156,31 @@ impl Default for TotanConfig {
             logging: Default::default(),
             timeouts: Default::default(),
             mitigation: Default::default(),
+            netfilter: Default::default(),
             ebpf: Default::default(),
             experimental_hyper_http: false,
         }
     }
+}
+
+/// Netfilter-mode rule management configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NetfilterConfig {
+    /// UIDs whose outbound TCP traffic on `redirect_ports` is transparently
+    /// redirected to totan's listener via an nftables OUTPUT rule.
+    ///
+    /// When empty totan does **not** touch nftables — configure redirect rules
+    /// externally (e.g. via a system nftables config or Ansible).
+    #[serde(default)]
+    pub redirect_uids: Vec<u32>,
+
+    /// TCP destination ports to intercept. Default: [80, 443].
+    #[serde(default = "default_redirect_ports")]
+    pub redirect_ports: Vec<u16>,
+}
+
+fn default_redirect_ports() -> Vec<u16> {
+    vec![80, 443]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
