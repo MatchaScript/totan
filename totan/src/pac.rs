@@ -684,3 +684,4 @@ mod tests {
         assert!(err.is_err(), "syntactically broken PAC must fail to load");
     }
 }
+

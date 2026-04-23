@@ -1,11 +1,22 @@
-/* Mozilla PAC helper library.
+/* PAC (Proxy Auto-Configuration) helper library.
  *
- * Adapted from:
- *   https://dxr.mozilla.org/mozilla-central/source/netwerk/base/ProxyAutoConfig.cpp
- * under MPL 2.0.
+ * Adapted from Firefox's `netwerk/base/ascii_pac_utils.js`:
+ *   https://searchfox.org/mozilla-central/source/netwerk/base/ascii_pac_utils.js
  *
- * The host reserves four functions as native bindings, supplied by
- * `pac.rs`: `dnsResolve`, `myIpAddress`, `shExpMatch`, and `alert`.
+ * In Firefox this file is preprocessed into `ascii_pac_utils.inc` and
+ * `#include`d in `ProxyAutoConfig.cpp` as the string constant
+ * `sAsciiPacUtils`, which is prepended to every user-supplied PAC script
+ * before evaluation. Distributed under MPL 2.0.
+ *
+ * Deliberate omissions vs. the Mozilla file:
+ *   - `shExpMatch` is NOT defined here; `pac.rs` supplies a native binding
+ *     backed by `glob::Pattern`, which is stricter than Mozilla's
+ *     regex-shim version (e.g. it actually honours `[abc]` char classes).
+ *
+ * Native bindings supplied by `pac.rs` (do not re-define in this file —
+ * a top-level `function foo()` declaration here would shadow the native
+ * binding):
+ *   `dnsResolve`, `myIpAddress`, `shExpMatch`, `alert`.
  */
 
 function dnsDomainIs(host, domain) {
