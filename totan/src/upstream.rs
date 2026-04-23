@@ -651,8 +651,10 @@ async fn tcp_connect_marked<A: tokio::net::ToSocketAddrs>(
     use socket2::{Domain, Protocol, Socket, Type};
     use tokio::net::TcpSocket;
 
-    let mut last_err =
-        std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "no addresses resolved");
+    let mut last_err = std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "no addresses resolved",
+    );
     for socket_addr in tokio::net::lookup_host(addr).await? {
         let domain = match socket_addr {
             SocketAddr::V4(_) => Domain::IPV4,
@@ -688,7 +690,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_rewrite_http_request() {
-        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler =
+            UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, mut client_mock) = tokio::io::duplex(1024);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
@@ -716,7 +719,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_http_proxy_connect() {
-        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler =
+            UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, _client_mock) = tokio::io::duplex(1024);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
@@ -747,7 +751,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_socks5_proxy_connect() {
-        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler =
+            UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, _client_mock) = tokio::io::duplex(1024);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
@@ -798,7 +803,8 @@ mod tests {
     /// copy_bidirectional without discarding or leaking any bytes.
     #[tokio::test]
     async fn test_connect_response_with_extra_headers() {
-        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler =
+            UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, client_mock) = tokio::io::duplex(4096);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
@@ -841,7 +847,8 @@ mod tests {
     /// an error and not attempt to tunnel into the 407 response body.
     #[tokio::test]
     async fn test_connect_rejected_407() {
-        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler =
+            UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, _client_mock) = tokio::io::duplex(4096);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
@@ -877,7 +884,8 @@ mod tests {
     /// 403 Forbidden when the target is not in the allow-list.
     #[tokio::test]
     async fn test_connect_rejected_403() {
-        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler =
+            UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut client, _client_mock) = tokio::io::duplex(4096);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 

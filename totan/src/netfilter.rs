@@ -20,8 +20,7 @@ use totan_common::config::NetfilterConfig;
 
 const TABLE: &str = "totan";
 
-const PRIVATE_NETS: &str =
-    "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16";
+const PRIVATE_NETS: &str = "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16";
 
 /// RAII guard that installs nftables rules on construction and removes them
 /// on drop.

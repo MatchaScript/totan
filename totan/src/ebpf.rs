@@ -148,7 +148,10 @@ impl Loader {
             TcAttachOptions::TcxOrder(LinkOrder::first()),
         )?;
         self.links.push(program.take_link(link_id)?);
-        info!(interface = iface, "totan eBPF tc ingress attached to new interface");
+        info!(
+            interface = iface,
+            "totan eBPF tc ingress attached to new interface"
+        );
         Ok(())
     }
 }
@@ -246,7 +249,11 @@ pub fn resolve_interfaces(patterns: &[String]) -> Vec<String> {
     let mut matched: Vec<String> = entries
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|name| patterns.iter().any(|p| glob_match(p.as_bytes(), name.as_bytes())))
+        .filter(|name| {
+            patterns
+                .iter()
+                .any(|p| glob_match(p.as_bytes(), name.as_bytes()))
+        })
         .collect();
     matched.sort_unstable();
     matched
@@ -255,7 +262,9 @@ pub fn resolve_interfaces(patterns: &[String]) -> Vec<String> {
 fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
     match pattern.first() {
         None => name.is_empty(),
-        Some(b'*') => glob_match(&pattern[1..], name) || (!name.is_empty() && glob_match(pattern, &name[1..])),
+        Some(b'*') => {
+            glob_match(&pattern[1..], name) || (!name.is_empty() && glob_match(pattern, &name[1..]))
+        }
         Some(b'?') => !name.is_empty() && glob_match(&pattern[1..], &name[1..]),
         Some(&c) => name.first() == Some(&c) && glob_match(&pattern[1..], &name[1..]),
     }
@@ -318,7 +327,10 @@ mod tests {
     fn resolve_lo_exact() {
         // `lo` is present on every Linux host; sanity-check resolve_interfaces.
         let result = resolve_interfaces(&["lo".to_string()]);
-        assert!(result.contains(&"lo".to_string()), "lo must be in /sys/class/net");
+        assert!(
+            result.contains(&"lo".to_string()),
+            "lo must be in /sys/class/net"
+        );
     }
 
     #[test]
@@ -338,7 +350,10 @@ mod tests {
         let result = resolve_interfaces(&["*".to_string()]);
         let mut sorted = result.clone();
         sorted.sort_unstable();
-        assert_eq!(result, sorted, "resolve_interfaces must return sorted names");
+        assert_eq!(
+            result, sorted,
+            "resolve_interfaces must return sorted names"
+        );
     }
 
     #[test]
