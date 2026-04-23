@@ -6,5 +6,6 @@ pub mod http_proxy;
 pub mod interceptor;
 pub mod netfilter;
 pub mod pac;
+pub mod proxy;
 pub mod upstream;
 pub mod utils;

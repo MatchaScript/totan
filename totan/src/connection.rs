@@ -3,22 +3,23 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use totan_common::{config::TotanConfig, InterceptedConnection, InterceptionMode};
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::pac::PacEngine;
+use crate::pac::PacEvaluator;
+use crate::proxy::{proxies_from_url_str, Proxies};
 use crate::upstream::UpstreamHandler;
 use crate::utils::extract_sni_hostname;
 
 enum ProxyResolver {
-    Pac(Arc<PacEngine>),
-    Fixed(Option<String>),
+    Pac(Arc<PacEvaluator>),
+    Fixed(Proxies),
 }
 
 impl ProxyResolver {
-    async fn resolve(&self, url: &str, host: &str) -> Result<Option<String>> {
+    async fn resolve(&self, url: &str, host: &str) -> Result<Proxies> {
         match self {
-            Self::Pac(engine) => engine.find_proxy_for_url(url, host).await,
-            Self::Fixed(proxy) => Ok(proxy.clone()),
+            Self::Pac(engine) => engine.find_proxy(url, host).await,
+            Self::Fixed(proxies) => Ok(proxies.clone()),
         }
     }
 }
@@ -35,12 +36,17 @@ impl ConnectionManager {
         // every connection is dispatched by the fixed default_proxy (or goes
         // DIRECT when that is also None).
         let resolver = if let Some(pac_file) = &config.pac_file {
-            let engine = PacEngine::new(pac_file)
+            let engine = PacEvaluator::from_file(pac_file)
                 .await?
                 .with_cache(config.pac_cache_ttl_secs, config.pac_cache_max_entries);
             ProxyResolver::Pac(Arc::new(engine))
+        } else if let Some(url) = config.default_proxy.as_deref() {
+            let proxies = proxies_from_url_str(url).map_err(|e| {
+                totan_common::TotanError::Config(format!("invalid default_proxy '{url}': {e}"))
+            })?;
+            ProxyResolver::Fixed(proxies)
         } else {
-            ProxyResolver::Fixed(config.default_proxy.clone())
+            ProxyResolver::Fixed(Proxies::direct())
         };
 
         // SO_MARK on upstream sockets is only needed in netfilter mode: the
@@ -122,18 +128,17 @@ impl ConnectionManager {
                 .unwrap_or_default()
         );
 
-        let upstream_proxy = self
-            .resolver
-            .resolve(&target_url, &hostname_for_url)
-            .await?;
-
-        match &upstream_proxy {
-            Some(p) => debug!("Upstream route: PROXY {}", p),
-            None => debug!("Upstream route: DIRECT"),
-        }
+        let proxies = match self.resolver.resolve(&target_url, &hostname_for_url).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("proxy resolution failed ({e}); falling back to DIRECT");
+                Proxies::direct()
+            }
+        };
+        debug!("Upstream route: {}", proxies);
 
         self.upstream_handler
-            .handle_connection(intercepted_conn, stream, upstream_proxy)
+            .handle_connection(intercepted_conn, stream, proxies)
             .await
     }
 }

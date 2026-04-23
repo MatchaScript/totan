@@ -3,6 +3,7 @@ use std::time::Duration;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use totan::proxy::{proxies_from_url_str, Proxies, Proxy, ProxyOrDirect};
 use totan_common::config::ErrorMitigationConfig;
 use totan_common::InterceptedConnection;
 
@@ -35,33 +36,41 @@ async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
     (server_side.unwrap().0, client_side.unwrap())
 }
 
-// ── protocol-level duplex tests ───────────────────────────────────────────────
+// ── protocol-level tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_socks5_flow_simulated() {
+async fn test_socks5_handshake_on_duplex() {
     let handler =
         totan::upstream::UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
 
-    let (mut client, mut client_mock) = tokio::io::duplex(1024);
-    let (mut upstream, _upstream_mock) = tokio::io::duplex(1024);
+    let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
     tokio::spawn(async move {
-        let _ = client_mock.write_all(b"PING").await;
-        let mut buf = [0u8; 4];
-        let _ = client_mock.read_exact(&mut buf).await;
-        assert_eq!(&buf, b"PONG");
-        let _ = client_mock.shutdown().await;
+        // Greet: no-auth
+        let mut buf = [0u8; 3];
+        upstream_mock.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, [0x05, 0x01, 0x00]);
+        upstream_mock.write_all(&[0x05, 0x00]).await.unwrap();
+        // Read and ignore the CONNECT request, then answer success.
+        let mut buf = [0u8; 12];
+        upstream_mock.read_exact(&mut buf).await.unwrap();
+        upstream_mock
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        drop(upstream_mock);
     });
 
-    let _ = tokio::time::timeout(
+    let result = tokio::time::timeout(
         Duration::from_millis(200),
-        handler.handle_socks5_proxy_impl::<tokio::io::DuplexStream, tokio::io::DuplexStream>(
-            tls_conn("example.com"),
-            &mut client,
+        handler.socks5_connect_impl::<tokio::io::DuplexStream>(
+            &tls_conn("example.com"),
             &mut upstream,
         ),
     )
-    .await;
+    .await
+    .expect("timed out");
+    assert!(result.is_ok());
 }
 
 // ── handle_connection level (real TCP on both sides) ──────────────────────────
@@ -93,6 +102,7 @@ async fn test_handle_connection_https_407_is_error() {
     });
 
     let proxy_url = format!("http://{}", proxy_addr);
+    let proxies = proxies_from_url_str(&proxy_url).unwrap();
     let handler =
         totan::upstream::UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
 
@@ -100,7 +110,7 @@ async fn test_handle_connection_https_407_is_error() {
 
     let result = tokio::time::timeout(
         Duration::from_millis(500),
-        handler.handle_connection(tls_conn("example.com"), totan_side, Some(proxy_url)),
+        handler.handle_connection(tls_conn("example.com"), totan_side, proxies),
     )
     .await
     .expect("timed out waiting for 407 handling");
@@ -129,6 +139,7 @@ async fn test_handle_connection_http_end_to_end() {
     });
 
     let proxy_url = format!("http://{}", proxy_addr);
+    let proxies = proxies_from_url_str(&proxy_url).unwrap();
     let handler =
         totan::upstream::UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
 
@@ -149,7 +160,7 @@ async fn test_handle_connection_http_end_to_end() {
 
     let result = tokio::time::timeout(
         Duration::from_millis(500),
-        handler.handle_connection(http_conn(), totan_side, Some(proxy_url)),
+        handler.handle_connection(http_conn(), totan_side, proxies),
     )
     .await
     .expect("timed out");
@@ -180,7 +191,9 @@ async fn test_pac_direct_does_not_reach_proxy() {
         )
         .unwrap();
 
-    let engine = totan::pac::PacEngine::new(pac_file.path()).await.unwrap();
+    let engine = totan::pac::PacEvaluator::from_file(pac_file.path())
+        .await
+        .unwrap();
 
     for (url, host) in [
         ("https://teams.microsoft.com/", "teams.microsoft.com"),
@@ -190,19 +203,17 @@ async fn test_pac_direct_does_not_reach_proxy() {
         ),
         ("https://outlook.office365.com/", "outlook.office365.com"),
     ] {
-        assert_eq!(
-            engine.find_proxy_for_url(url, host).await.unwrap(),
-            None,
-            "{host} should be DIRECT"
-        );
+        let p = engine.find_proxy(url, host).await.unwrap();
+        assert_eq!(p, Proxies::direct(), "{host} should be DIRECT");
     }
 
+    let p = engine
+        .find_proxy("https://internal.corp.example/", "internal.corp.example")
+        .await
+        .unwrap();
     assert_eq!(
-        engine
-            .find_proxy_for_url("https://internal.corp.example/", "internal.corp.example")
-            .await
-            .unwrap(),
-        Some("http://127.0.0.1:19999".to_string()),
+        p.first(),
+        &ProxyOrDirect::Proxy(Proxy::Http("127.0.0.1:19999".parse().unwrap())),
         "non-breakout host must still use proxy"
     );
 }

@@ -1,6 +1,7 @@
 use crate::http_proxy::{serve_http_connection, HttpProxyContext};
+use crate::proxy::{HostAndPort, Proxies, Proxy, ProxyOrDirect};
 use crate::utils::tolerant_copy_bidirectional;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8,7 +9,34 @@ use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 use totan_common::{config::ErrorMitigationConfig, InterceptedConnection, TotanError};
 use tracing::{debug, warn};
-use url::Url;
+
+/// Distinguishes the two failure modes a PAC entry can hit:
+/// - `Connect`: TCP-level failure (timeout, refused, unreachable). The proxy
+///   itself may be down; falling back to DIRECT is a sensible last resort.
+/// - `Handshake`: the proxy was reachable but rejected the tunnel (407, 403,
+///   SOCKS5 non-success). A DIRECT fallback here would leak traffic the
+///   operator intentionally routed through a proxy, so we refuse.
+enum EstablishError {
+    Connect(anyhow::Error),
+    Handshake(anyhow::Error),
+}
+
+impl EstablishError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::Connect(e) | Self::Handshake(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for EstablishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(e) => write!(f, "connect: {e}"),
+            Self::Handshake(e) => write!(f, "handshake: {e}"),
+        }
+    }
+}
 
 pub struct UpstreamHandler {
     connect_timeout: Duration,
@@ -29,132 +57,160 @@ impl UpstreamHandler {
         })
     }
 
+    /// Walk the PAC failover list trying each entry until one succeeds. An
+    /// entry is "committed" the moment we start relaying client bytes; up to
+    /// that point a transport/handshake failure advances to the next entry.
+    ///
+    /// The HTTP-over-HTTP-proxy path (plain HTTP target with an HTTP proxy)
+    /// is special: it's delegated to Pingora which owns both streams and
+    /// can't be rolled back. That case ends the loop on the first match.
     pub async fn handle_connection(
         &self,
         intercepted_conn: InterceptedConnection,
-        client_stream: TcpStream,
-        upstream_proxy: Option<String>,
+        mut client_stream: TcpStream,
+        proxies: Proxies,
     ) -> Result<()> {
-        match upstream_proxy {
-            Some(proxy) => {
-                self.handle_proxy_connection(intercepted_conn, client_stream, proxy)
-                    .await
+        let mut last_err: Option<anyhow::Error> = None;
+        // Any handshake-level rejection disables the DIRECT mitigation below:
+        // a proxy that actively rejects the tunnel is a policy decision, not a
+        // transport outage, and silently re-routing would leak traffic.
+        let mut any_handshake_failure = false;
+
+        for entry in &proxies {
+            // Pingora path: client stream is consumed, no failover possible.
+            if intercepted_conn.original_dest.port() != 443 {
+                if let ProxyOrDirect::Proxy(Proxy::Http(ep)) = entry {
+                    let proxy_url = format!("http://{}", ep);
+                    let ctx = HttpProxyContext::new(
+                        intercepted_conn.clone(),
+                        &proxy_url,
+                        self.upstream_mark,
+                    )?;
+                    return serve_http_connection(client_stream, ctx).await;
+                }
             }
-            None => {
-                self.handle_direct_connection(intercepted_conn, client_stream)
+
+            match self.try_establish(&intercepted_conn, entry).await {
+                Ok(mut upstream) => {
+                    let _ = client_stream.set_nodelay(true);
+                    let _ = upstream.set_nodelay(true);
+                    let _ = tolerant_copy_bidirectional(&mut client_stream, &mut upstream).await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("upstream entry {} failed: {}", entry, e);
+                    if matches!(e, EstablishError::Handshake(_)) {
+                        any_handshake_failure = true;
+                    }
+                    last_err = Some(e.into_inner());
+                }
+            }
+        }
+
+        // Every entry exhausted. Last-resort DIRECT fallback only fires when
+        // the PAC list didn't already contain DIRECT and every failure was a
+        // transport-level connect failure.
+        let has_direct_entry = proxies.iter().any(|e| matches!(e, ProxyOrDirect::Direct));
+        if self.mitigation.try_direct_on_proxy_failure
+            && !has_direct_entry
+            && !any_handshake_failure
+        {
+            warn!("all PAC entries failed to connect; trying direct connection as mitigation");
+            return self
+                .handle_direct_connection(intercepted_conn, client_stream)
+                .await;
+        }
+        if self.mitigation.rst_on_failure {
+            self.send_rst_and_close(&mut client_stream).await;
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("empty proxy list")))
+    }
+
+    /// Pre-negotiate an upstream tunnel (or a direct connection) so the caller
+    /// can relay bytes verbatim. Returns the ready-to-copy stream. Any retry
+    /// (per mitigation) happens inside this call — callers see a single
+    /// success/failure per entry.
+    async fn try_establish(
+        &self,
+        intercepted: &InterceptedConnection,
+        entry: &ProxyOrDirect,
+    ) -> Result<TcpStream, EstablishError> {
+        match entry {
+            ProxyOrDirect::Direct => self
+                .connect_with_retry(intercepted.original_dest, "direct")
+                .await
+                .map_err(EstablishError::Connect),
+            ProxyOrDirect::Proxy(Proxy::Http(ep)) => {
+                // Plain-HTTP targets via HTTP proxy are handled by Pingora in
+                // the caller. Anything arriving here is therefore TLS (CONNECT).
+                let mut upstream = self
+                    .connect_to_proxy(ep)
                     .await
+                    .map_err(EstablishError::Connect)?;
+                self.http_connect_impl(intercepted, &mut upstream)
+                    .await
+                    .map_err(EstablishError::Handshake)?;
+                Ok(upstream)
+            }
+            ProxyOrDirect::Proxy(Proxy::Socks5(ep)) => {
+                let mut upstream = self
+                    .connect_to_proxy(ep)
+                    .await
+                    .map_err(EstablishError::Connect)?;
+                self.socks5_connect_impl(intercepted, &mut upstream)
+                    .await
+                    .map_err(EstablishError::Handshake)?;
+                Ok(upstream)
             }
         }
     }
 
-    async fn handle_proxy_connection(
-        &self,
-        intercepted_conn: InterceptedConnection,
-        mut client_stream: TcpStream,
-        proxy_url: String,
-    ) -> Result<()> {
-        let url = Url::parse(&proxy_url)
-            .map_err(|e| TotanError::Config(format!("Invalid proxy URL '{}': {}", proxy_url, e)))?;
+    async fn connect_to_proxy(&self, ep: &HostAndPort) -> Result<TcpStream> {
+        let addr = ep.to_string();
+        self.connect_with_retry(addr.as_str(), "proxy").await
+    }
 
-        // Plain HTTP through an HTTP proxy: Pingora owns the end-to-end
-        // HTTP semantics (absolute-form rewriting, keep-alive, per-request
-        // forwarding). TLS (CONNECT) and SOCKS5 stay on the tunneled path
-        // below because they are opaque byte pipes after a short handshake.
-        if url.scheme() == "http" && intercepted_conn.original_dest.port() != 443 {
-            let ctx = HttpProxyContext::new(intercepted_conn, &proxy_url, self.upstream_mark)?;
-            return serve_http_connection(client_stream, ctx).await;
-        }
-
-        let proxy_addr = format!(
-            "{}:{}",
-            url.host_str().unwrap_or("localhost"),
-            url.port().unwrap_or(8080)
-        );
-
-        debug!(
-            "Connecting to upstream proxy {} for {}",
-            proxy_addr, intercepted_conn.original_dest
-        );
-
-        // Connect to upstream proxy with timeout and retries
-        let mut attempt: u32 = 0;
+    async fn connect_with_retry<A>(&self, addr: A, what: &str) -> Result<TcpStream>
+    where
+        A: tokio::net::ToSocketAddrs + std::fmt::Display + Copy,
+    {
         let max_attempts = self.mitigation.retry_attempts.saturating_add(1);
-        let mut upstream_stream_opt: Option<TcpStream> = None;
+        let mut attempt: u32 = 0;
         loop {
             match timeout(
                 self.connect_timeout,
-                tcp_connect_marked(&proxy_addr, self.upstream_mark),
+                tcp_connect_marked(addr, self.upstream_mark),
             )
             .await
             {
-                Ok(Ok(stream)) => {
-                    upstream_stream_opt = Some(stream);
-                    break;
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "Failed to connect to upstream proxy {}: {} (attempt {}/{})",
-                        proxy_addr,
-                        e,
-                        attempt + 1,
-                        max_attempts
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        "Timeout connecting to upstream proxy {} after {:?} (attempt {}/{})",
-                        proxy_addr,
-                        self.connect_timeout,
-                        attempt + 1,
-                        max_attempts
-                    );
-                }
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(e)) => warn!(
+                    "Failed to connect to {} {}: {} (attempt {}/{})",
+                    what,
+                    addr,
+                    e,
+                    attempt + 1,
+                    max_attempts
+                ),
+                Err(_) => warn!(
+                    "Timeout connecting to {} {} after {:?} (attempt {}/{})",
+                    what,
+                    addr,
+                    self.connect_timeout,
+                    attempt + 1,
+                    max_attempts
+                ),
             }
             attempt += 1;
             if attempt >= max_attempts {
-                break;
+                return Err(TotanError::Network(format!(
+                    "{} connection to {} failed after {} attempts",
+                    what, addr, max_attempts
+                ))
+                .into());
             }
-            // backoff
             let delay = self.mitigation.retry_backoff_ms * (1u64 << (attempt - 1).min(8));
             sleep(Duration::from_millis(delay)).await;
-        }
-
-        let upstream_stream = if let Some(s) = upstream_stream_opt {
-            s
-        } else {
-            // Failed all attempts: optionally try direct fallback
-            if self.mitigation.try_direct_on_proxy_failure {
-                warn!("Proxy connect failed; trying direct connection as fallback");
-                return self
-                    .handle_direct_connection(intercepted_conn, client_stream)
-                    .await;
-            }
-            if self.mitigation.rst_on_failure {
-                self.send_rst_and_close(&mut client_stream).await;
-            }
-            return Err(TotanError::UpstreamProxy(format!(
-                "Connection to {} failed after {} attempts",
-                proxy_addr, max_attempts
-            ))
-            .into());
-        };
-
-        // Reduce small-packet latency on both ends
-        let _ = client_stream.set_nodelay(true);
-
-        match url.scheme() {
-            // Only reached with target port 443 — plain HTTP was diverted to Pingora above.
-            "http" => {
-                self.handle_https_connect(intercepted_conn, client_stream, upstream_stream)
-                    .await
-            }
-            "socks5" => {
-                self.handle_socks5_proxy(intercepted_conn, client_stream, upstream_stream)
-                    .await
-            }
-            scheme => {
-                Err(TotanError::Config(format!("Unsupported proxy scheme: {}", scheme)).into())
-            }
         }
     }
 
@@ -167,99 +223,37 @@ impl UpstreamHandler {
             "Establishing direct connection to {}",
             intercepted_conn.original_dest
         );
-
-        // Connect directly to original destination with retries
-        let mut attempt: u32 = 0;
-        let max_attempts = self.mitigation.retry_attempts.saturating_add(1);
-        let mut upstream_stream_opt: Option<TcpStream> = None;
-        loop {
-            match timeout(
-                self.connect_timeout,
-                tcp_connect_marked(intercepted_conn.original_dest, self.upstream_mark),
-            )
+        let mut upstream = match self
+            .connect_with_retry(intercepted_conn.original_dest, "direct")
             .await
-            {
-                Ok(Ok(stream)) => {
-                    upstream_stream_opt = Some(stream);
-                    break;
+        {
+            Ok(s) => s,
+            Err(e) => {
+                if self.mitigation.rst_on_failure {
+                    self.send_rst_and_close(&mut client_stream).await;
                 }
-                Ok(Err(e)) => {
-                    warn!(
-                        "Failed to connect directly to {}: {} (attempt {}/{})",
-                        intercepted_conn.original_dest,
-                        e,
-                        attempt + 1,
-                        max_attempts
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        "Timeout connecting directly to {} after {:?} (attempt {}/{})",
-                        intercepted_conn.original_dest,
-                        self.connect_timeout,
-                        attempt + 1,
-                        max_attempts
-                    );
-                }
+                return Err(e);
             }
-            attempt += 1;
-            if attempt >= max_attempts {
-                break;
-            }
-            let delay = self.mitigation.retry_backoff_ms * (1u64 << (attempt - 1).min(8));
-            sleep(Duration::from_millis(delay)).await;
-        }
-        let mut upstream_stream = if let Some(s) = upstream_stream_opt {
-            s
-        } else {
-            if self.mitigation.rst_on_failure {
-                self.send_rst_and_close(&mut client_stream).await;
-            }
-            return Err(TotanError::Network(format!(
-                "Direct connection to {} failed after {} attempts",
-                intercepted_conn.original_dest, max_attempts
-            ))
-            .into());
         };
-        // Reduce latency
         let _ = client_stream.set_nodelay(true);
-        let _ = upstream_stream.set_nodelay(true);
-
-        // Start bidirectional data copying
-        let _ = tolerant_copy_bidirectional(&mut client_stream, &mut upstream_stream).await;
-
+        let _ = upstream.set_nodelay(true);
+        let _ = tolerant_copy_bidirectional(&mut client_stream, &mut upstream).await;
         Ok(())
     }
 
-    async fn handle_https_connect(
+    pub async fn http_connect_impl<U>(
         &self,
-        intercepted_conn: InterceptedConnection,
-        mut client_stream: TcpStream,
-        mut upstream_stream: TcpStream,
-    ) -> Result<()> {
-        self.handle_https_connect_impl(intercepted_conn, &mut client_stream, &mut upstream_stream)
-            .await
-    }
-
-    pub async fn handle_https_connect_impl<C, U>(
-        &self,
-        intercepted_conn: InterceptedConnection,
-        client_stream: &mut C,
+        intercepted: &InterceptedConnection,
         upstream_stream: &mut U,
     ) -> Result<()>
     where
-        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
         U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let authority_host = intercepted_conn
+        let authority_host = intercepted
             .sni_hostname
             .clone()
-            .unwrap_or_else(|| intercepted_conn.original_dest.ip().to_string());
-        let authority = format!(
-            "{}:{}",
-            authority_host,
-            intercepted_conn.original_dest.port()
-        );
+            .unwrap_or_else(|| intercepted.original_dest.ip().to_string());
+        let authority = format!("{}:{}", authority_host, intercepted.original_dest.port());
         debug!("HTTP proxy CONNECT to {}", authority);
         let connect_request = format!(
             "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n",
@@ -268,6 +262,7 @@ impl UpstreamHandler {
         upstream_stream
             .write_all(connect_request.as_bytes())
             .await?;
+
         // Read until \r\n\r\n so TCP-split responses are handled correctly.
         let mut response = Vec::with_capacity(256);
         let mut byte = [0u8; 1];
@@ -288,149 +283,117 @@ impl UpstreamHandler {
         let response_str = String::from_utf8_lossy(&response);
         if response_str.starts_with("HTTP/1.1 200") || response_str.starts_with("HTTP/1.0 200") {
             debug!("HTTP proxy CONNECT successful");
-            let _ = tolerant_copy_bidirectional(client_stream, upstream_stream).await;
             Ok(())
         } else {
             warn!(
                 "HTTP proxy CONNECT rejected: {}",
                 response_str.lines().next().unwrap_or("").trim()
             );
-            self.send_rst_and_close_generic(client_stream).await;
             Err(TotanError::UpstreamProxy("HTTP proxy CONNECT request failed".to_string()).into())
         }
     }
 
-    async fn handle_socks5_proxy(
+    pub async fn socks5_connect_impl<U>(
         &self,
-        intercepted_conn: InterceptedConnection,
-        mut client_stream: TcpStream,
-        mut upstream_stream: TcpStream,
-    ) -> Result<()> {
-        self.handle_socks5_proxy_impl(intercepted_conn, &mut client_stream, &mut upstream_stream)
-            .await
-    }
-
-    pub async fn handle_socks5_proxy_impl<C, U>(
-        &self,
-        intercepted_conn: InterceptedConnection,
-        client_stream: &mut C,
+        intercepted: &InterceptedConnection,
         upstream_stream: &mut U,
     ) -> Result<()>
     where
-        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
         U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        // 1) Greeting: no authentication supported
-        // client: VER=5, NMETHODS=1, METHODS=[0x00]
-        let greet = [0x05u8, 0x01, 0x00];
-        upstream_stream.write_all(&greet).await?;
+        // 1) Greeting: no-auth only
+        upstream_stream.write_all(&[0x05u8, 0x01, 0x00]).await?;
         upstream_stream.flush().await?;
-        // server: VER=5, METHOD=0x00 (no auth) expected
         let mut resp = [0u8; 2];
         upstream_stream.read_exact(&mut resp).await?;
         if resp[0] != 0x05 || resp[1] != 0x00 {
-            warn!(
-                "SOCKS5 server requires unsupported auth method: {:02x}",
+            return Err(TotanError::UpstreamProxy(format!(
+                "SOCKS5 auth method unsupported: {:02x}",
                 resp[1]
-            );
-            self.send_rst_and_close_generic(client_stream).await;
-            return Err(
-                TotanError::UpstreamProxy("SOCKS5 auth method unsupported".to_string()).into(),
-            );
+            ))
+            .into());
         }
 
-        // 2) CONNECT request to target
-        // Build address field: prefer domain from SNI, else use IP (v4/v6)
+        // 2) CONNECT request: prefer the hostname (via SNI) so the proxy can
+        // do its own resolution; fall back to the IP when there is no name.
         let mut req: Vec<u8> = Vec::with_capacity(32);
-        req.push(0x05); // VER
-        req.push(0x01); // CMD=CONNECT
-        req.push(0x00); // RSV
-        if let Some(host) = &intercepted_conn.sni_hostname {
+        req.push(0x05);
+        req.push(0x01);
+        req.push(0x00);
+        if let Some(host) = &intercepted.sni_hostname {
             debug!(
                 "SOCKS5 CONNECT to {}:{}",
                 host,
-                intercepted_conn.original_dest.port()
+                intercepted.original_dest.port()
             );
             let host_bytes = host.as_bytes();
             let len = host_bytes.len().min(255);
-            req.push(0x03); // ATYP=DOMAIN
+            req.push(0x03);
             req.push(len as u8);
             req.extend_from_slice(&host_bytes[..len]);
         } else {
-            match intercepted_conn.original_dest.ip() {
+            match intercepted.original_dest.ip() {
                 std::net::IpAddr::V4(v4) => {
                     debug!(
                         "SOCKS5 CONNECT to {}:{}",
                         v4,
-                        intercepted_conn.original_dest.port()
+                        intercepted.original_dest.port()
                     );
-                    req.push(0x01); // ATYP=IPv4
+                    req.push(0x01);
                     req.extend_from_slice(&v4.octets());
                 }
                 std::net::IpAddr::V6(v6) => {
                     debug!(
                         "SOCKS5 CONNECT to {}:{}",
                         v6,
-                        intercepted_conn.original_dest.port()
+                        intercepted.original_dest.port()
                     );
-                    req.push(0x04); // ATYP=IPv6
+                    req.push(0x04);
                     req.extend_from_slice(&v6.octets());
                 }
             }
         }
-        req.extend_from_slice(&intercepted_conn.original_dest.port().to_be_bytes());
+        req.extend_from_slice(&intercepted.original_dest.port().to_be_bytes());
         upstream_stream.write_all(&req).await?;
         upstream_stream.flush().await?;
 
-        // 3) Read CONNECT reply
-        // VER, REP, RSV, ATYP, BND.ADDR..., BND.PORT
+        // 3) Reply
         let mut head = [0u8; 4];
         upstream_stream.read_exact(&mut head).await?;
         if head[0] != 0x05 {
-            self.send_rst_and_close_generic(client_stream).await;
             return Err(
                 TotanError::UpstreamProxy("Invalid SOCKS5 reply version".to_string()).into(),
             );
         }
         if head[1] != 0x00 {
-            self.send_rst_and_close_generic(client_stream).await;
             return Err(TotanError::UpstreamProxy(format!(
                 "SOCKS5 CONNECT failed, code {:02x}",
                 head[1]
             ))
             .into());
         }
-        // consume bound address based on ATYP
-        let atyp = head[3];
-        match atyp {
+        match head[3] {
             0x01 => {
-                // IPv4
-                let mut rest = [0u8; 6]; // 4 addr + 2 port
+                let mut rest = [0u8; 6];
                 upstream_stream.read_exact(&mut rest).await?;
             }
             0x03 => {
-                // DOMAIN
                 let mut len = [0u8; 1];
                 upstream_stream.read_exact(&mut len).await?;
                 let mut skip = vec![0u8; len[0] as usize + 2];
                 upstream_stream.read_exact(&mut skip).await?;
             }
             0x04 => {
-                // IPv6
-                let mut rest = [0u8; 18]; // 16 addr + 2 port
+                let mut rest = [0u8; 18];
                 upstream_stream.read_exact(&mut rest).await?;
             }
             _ => {}
         }
-
-        // 4) Tunnel data
-        let _ = tolerant_copy_bidirectional(client_stream, upstream_stream).await;
         Ok(())
     }
 
     async fn send_rst_and_close(&self, stream: &mut TcpStream) {
         if self.mitigation.rst_on_failure {
-            // Send TCP RST by setting SO_LINGER to 0 and closing
             #[cfg(unix)]
             {
                 use socket2::Socket;
@@ -440,17 +403,11 @@ impl UpstreamHandler {
                 let fd = stream.as_raw_fd();
                 let socket = unsafe { Socket::from_raw_fd(fd) };
                 let _ = socket.set_linger(Some(Duration::from_secs(0)));
-                std::mem::forget(socket); // Don't close the fd, stream owns it
+                // Keep ownership of the fd on `stream` — drop the socket
+                // wrapper without running its destructor.
+                std::mem::forget(socket);
             }
         }
-        let _ = stream.shutdown().await; // graceful if RST disabled
-    }
-
-    async fn send_rst_and_close_generic<S>(&self, stream: &mut S)
-    where
-        S: tokio::io::AsyncWrite + Unpin,
-    {
-        // For generic streams (like mocks), just shutdown
         let _ = stream.shutdown().await;
     }
 }
@@ -503,9 +460,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_https_connect() {
+    async fn test_http_connect_tunnel() {
         let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
-        let (mut client, _client_mock) = tokio::io::duplex(1024);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
         let mut conn = test_conn();
@@ -521,73 +477,59 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await
                 .unwrap();
-            // Drop upstream_mock to close the tunnel
             drop(upstream_mock);
         });
 
-        // Use a timeout to prevent hanging forever
-        let _ = tokio::time::timeout(
+        let res = tokio::time::timeout(
             Duration::from_millis(100),
-            handler.handle_https_connect_impl(conn, &mut client, &mut upstream),
+            handler.http_connect_impl(&conn, &mut upstream),
         )
-        .await;
+        .await
+        .expect("timed out");
+        assert!(res.is_ok(), "CONNECT negotiation should succeed");
     }
 
     #[tokio::test]
-    async fn test_handle_socks5_proxy_connect() {
+    async fn test_socks5_tunnel() {
         let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
-        let (mut client, _client_mock) = tokio::io::duplex(1024);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
         let mut conn = test_conn();
         conn.sni_hostname = Some("example.com".to_string());
 
         tokio::spawn(async move {
-            // 1. Greet
             let mut buf = [0u8; 3];
             upstream_mock.read_exact(&mut buf).await.unwrap();
             assert_eq!(buf, [0x05, 0x01, 0x00]);
             upstream_mock.write_all(&[0x05, 0x00]).await.unwrap();
 
-            // 2. Connect
-            let mut buf = [0u8; 12]; // VER, CMD, RSV, ATYP, LEN, "example.com", PORT(2)
-            let _ = upstream_mock.read_exact(&mut buf).await.unwrap();
-            assert_eq!(buf[0], 0x05); // VER
-            assert_eq!(buf[1], 0x01); // CMD
-            assert_eq!(buf[3], 0x03); // ATYP DOMAIN
+            let mut buf = [0u8; 12];
+            upstream_mock.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf[0], 0x05);
+            assert_eq!(buf[1], 0x01);
+            assert_eq!(buf[3], 0x03);
 
-            // 3. Reply
             upstream_mock
                 .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
                 .await
                 .unwrap();
-            // Drop to close tunnel
             drop(upstream_mock);
         });
 
-        let _ = tokio::time::timeout(
+        let res = tokio::time::timeout(
             Duration::from_millis(100),
-            handler.handle_socks5_proxy_impl(conn, &mut client, &mut upstream),
+            handler.socks5_connect_impl(&conn, &mut upstream),
         )
-        .await;
+        .await
+        .expect("timed out");
+        assert!(res.is_ok(), "SOCKS5 negotiation should succeed");
     }
 
-    // ── CONNECT response robustness ───────────────────────────────────────────
-
-    /// A real upstream proxy (Squid, nginx, corporate gateway) typically adds
-    /// extra headers after the 200 status line before the blank line:
-    ///
-    ///   HTTP/1.1 200 Connection established\r\n
-    ///   Proxy-Agent: Squid\r\n
-    ///   \r\n
-    ///
-    /// The response can also arrive in multiple TCP segments. Our byte-by-byte
-    /// read loop must consume exactly up to \r\n\r\n and hand the tunnel to
-    /// copy_bidirectional without discarding or leaking any bytes.
+    /// Multi-header CONNECT response split across TCP segments must still
+    /// be parsed correctly before handing off to the byte-pipe.
     #[tokio::test]
     async fn test_connect_response_with_extra_headers() {
         let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
-        let (mut client, client_mock) = tokio::io::duplex(4096);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
         let mut conn = test_conn();
@@ -596,10 +538,7 @@ mod tests {
 
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            upstream_mock.read(&mut buf).await.unwrap();
-
-            // Simulate a Squid-style multi-header CONNECT response arriving in
-            // two separate writes (TCP segment split after the status line).
+            let _ = upstream_mock.read(&mut buf).await.unwrap();
             upstream_mock
                 .write_all(b"HTTP/1.1 200 Connection established\r\n")
                 .await
@@ -608,29 +547,22 @@ mod tests {
                 .write_all(b"Proxy-Agent: Squid/5.7\r\nDate: Mon, 01 Jan 2024 00:00:00 GMT\r\n\r\n")
                 .await
                 .unwrap();
-
             drop(upstream_mock);
         });
 
-        // Drop client_mock immediately so copy_bidirectional terminates as
-        // soon as the CONNECT response is consumed and the tunnel opens.
-        drop(client_mock);
-
-        // Should succeed: 200 response even with extra headers and TCP split.
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            handler.handle_https_connect_impl(conn, &mut client, &mut upstream),
+            handler.http_connect_impl(&conn, &mut upstream),
         )
-        .await;
-        assert!(result.is_ok(), "timed out waiting for CONNECT to complete");
+        .await
+        .expect("timed out");
+        assert!(result.is_ok(), "CONNECT with trailing headers must succeed");
     }
 
-    /// Upstream proxy requires authentication (407). totan must surface this as
-    /// an error and not attempt to tunnel into the 407 response body.
+    /// 407 (proxy auth required) surfaces as an error, not a silent tunnel.
     #[tokio::test]
     async fn test_connect_rejected_407() {
         let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
-        let (mut client, _client_mock) = tokio::io::duplex(4096);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
         let mut conn = test_conn();
@@ -639,7 +571,7 @@ mod tests {
 
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            upstream_mock.read(&mut buf).await.unwrap();
+            let _ = upstream_mock.read(&mut buf).await.unwrap();
             upstream_mock
                 .write_all(
                     b"HTTP/1.1 407 Proxy Authentication Required\r\n\
@@ -653,20 +585,17 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            handler.handle_https_connect_impl(conn, &mut client, &mut upstream),
+            handler.http_connect_impl(&conn, &mut upstream),
         )
         .await
         .expect("timed out");
-
-        assert!(result.is_err(), "407 must be returned as an error");
+        assert!(result.is_err(), "407 must be an error");
     }
 
-    /// Corporate proxies that forward to a second-tier proxy may reject with
-    /// 403 Forbidden when the target is not in the allow-list.
+    /// 403 from a chained corporate proxy also surfaces as an error.
     #[tokio::test]
     async fn test_connect_rejected_403() {
         let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
-        let (mut client, _client_mock) = tokio::io::duplex(4096);
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
         let mut conn = test_conn();
@@ -675,7 +604,7 @@ mod tests {
 
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            upstream_mock.read(&mut buf).await.unwrap();
+            let _ = upstream_mock.read(&mut buf).await.unwrap();
             upstream_mock
                 .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 .await
@@ -685,11 +614,10 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            handler.handle_https_connect_impl(conn, &mut client, &mut upstream),
+            handler.http_connect_impl(&conn, &mut upstream),
         )
         .await
         .expect("timed out");
-
-        assert!(result.is_err(), "403 must be returned as an error");
+        assert!(result.is_err(), "403 must be an error");
     }
 }
