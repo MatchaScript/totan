@@ -61,19 +61,20 @@ pub struct TproxyConfig {
 unsafe impl aya::Pod for TproxyConfig {}
 
 pub struct Loader {
-    // Held for RAII: dropping `Ebpf` detaches all programs and tears down maps.
+    // Held for RAII: dropping `_ebpf` detaches all programs and tears down maps.
     _ebpf: Ebpf,
-    _link: aya::programs::tc::SchedClassifierLink,
+    // Each element keeps one tcx attachment alive; drop = detach.
+    links: Vec<aya::programs::tc::SchedClassifierLink>,
     fwmark: u32,
     owned_routing: bool,
 }
 
 impl Loader {
-    /// Load the tc ingress program, configure the `TOTAN_CONFIG` map,
-    /// tcx-attach it to `ingress_iface` with first-position ordering, then
-    /// configure policy routing so fwmark-tagged packets are delivered locally.
+    /// Load the tc ingress program, configure the `TOTAN_CONFIG` map, then
+    /// tcx-attach it to every interface in `ingress_ifaces` with first-position
+    /// ordering. Policy routing is also configured automatically.
     pub fn load_and_attach(
-        ingress_iface: &str,
+        ingress_ifaces: &[&str],
         tproxy_addr: Ipv4Addr,
         tproxy_port: u16,
         fwmark: u32,
@@ -108,27 +109,47 @@ impl Loader {
         // tcx attach with first-position ordering for Cilium coexistence.
         // `LinkOrder::first()` installs us before any existing tcx programs on
         // the same hook so sk_assign runs before downstream policy/NAT.
-        let link_id = program.attach_with_options(
-            ingress_iface,
-            TcAttachType::Ingress,
-            TcAttachOptions::TcxOrder(LinkOrder::first()),
-        )?;
-        let link = program.take_link(link_id)?;
-
-        info!(
-            interface = ingress_iface,
-            tproxy = %format!("{}:{}", tproxy_addr, tproxy_port),
-            fwmark = format!("0x{:04X}", fwmark),
-            "totan eBPF tc ingress attached"
-        );
+        let mut links = Vec::with_capacity(ingress_ifaces.len());
+        for iface in ingress_ifaces {
+            let link_id = program.attach_with_options(
+                iface,
+                TcAttachType::Ingress,
+                TcAttachOptions::TcxOrder(LinkOrder::first()),
+            )?;
+            links.push(program.take_link(link_id)?);
+            info!(
+                interface = iface,
+                tproxy = %format!("{}:{}", tproxy_addr, tproxy_port),
+                fwmark = format!("0x{:04X}", fwmark),
+                "totan eBPF tc ingress attached"
+            );
+        }
 
         let owned = setup_policy_routing(fwmark)?;
         Ok(Self {
             _ebpf: ebpf,
-            _link: link,
+            links,
             fwmark,
             owned_routing: owned,
         })
+    }
+
+    /// Attach the already-loaded tc program to an additional interface.
+    /// Called by the interface watcher when a new matching device appears.
+    pub fn attach_interface(&mut self, iface: &str) -> anyhow::Result<()> {
+        let program: &mut SchedClassifier = self
+            ._ebpf
+            .program_mut("totan_tc_ingress")
+            .ok_or_else(|| anyhow::anyhow!("totan_tc_ingress not found"))?
+            .try_into()?;
+        let link_id = program.attach_with_options(
+            iface,
+            TcAttachType::Ingress,
+            TcAttachOptions::TcxOrder(LinkOrder::first()),
+        )?;
+        self.links.push(program.take_link(link_id)?);
+        info!(interface = iface, "totan eBPF tc ingress attached to new interface");
+        Ok(())
     }
 }
 
@@ -213,4 +234,120 @@ fn teardown_policy_routing(fwmark: u32) {
 
 fn run_cmd(args: &[&str]) -> anyhow::Result<std::process::ExitStatus> {
     Ok(Command::new(args[0]).args(&args[1..]).status()?)
+}
+
+/// Enumerate `/sys/class/net` and return all interface names that match at
+/// least one of the given patterns. Patterns support `*` (any sequence) and
+/// `?` (any single character); a pattern with no wildcards is an exact match.
+pub fn resolve_interfaces(patterns: &[String]) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return vec![];
+    };
+    let mut matched: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| patterns.iter().any(|p| glob_match(p.as_bytes(), name.as_bytes())))
+        .collect();
+    matched.sort_unstable();
+    matched
+}
+
+fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
+    match pattern.first() {
+        None => name.is_empty(),
+        Some(b'*') => glob_match(&pattern[1..], name) || (!name.is_empty() && glob_match(pattern, &name[1..])),
+        Some(b'?') => !name.is_empty() && glob_match(&pattern[1..], &name[1..]),
+        Some(&c) => name.first() == Some(&c) && glob_match(&pattern[1..], &name[1..]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn m(pattern: &str, name: &str) -> bool {
+        glob_match(pattern.as_bytes(), name.as_bytes())
+    }
+
+    #[test]
+    fn glob_exact() {
+        assert!(m("eth0", "eth0"));
+        assert!(!m("eth0", "eth1"));
+        assert!(!m("eth0", "eth"));
+        assert!(!m("eth0", "eth00"));
+    }
+
+    #[test]
+    fn glob_star() {
+        assert!(m("lxc*", "lxc12345678"));
+        assert!(m("lxc*", "lxc"));
+        assert!(!m("lxc*", "vlxc1"));
+        assert!(m("*", "eth0"));
+        assert!(m("*", "lo"));
+        assert!(m("*", ""));
+        assert!(m("eth*0", "eth0"));
+        assert!(m("eth*0", "eth123450"));
+        assert!(!m("eth*0", "eth1"));
+    }
+
+    #[test]
+    fn glob_question() {
+        assert!(m("eth?", "eth0"));
+        assert!(m("eth?", "etha"));
+        assert!(!m("eth?", "eth"));
+        assert!(!m("eth?", "eth12"));
+        assert!(m("lxc????????", "lxc12345678"));
+        assert!(!m("lxc????????", "lxc1234567"));
+    }
+
+    #[test]
+    fn glob_empty_pattern() {
+        assert!(m("", ""));
+        assert!(!m("", "a"));
+    }
+
+    #[test]
+    fn glob_multiple_stars() {
+        assert!(m("**", "anything"));
+        assert!(m("l*x*", "lxc1"));
+        assert!(m("l*x*", "loopbackxyz"));
+        assert!(!m("l*x*", "eth0"));
+    }
+
+    #[test]
+    fn resolve_lo_exact() {
+        // `lo` is present on every Linux host; sanity-check resolve_interfaces.
+        let result = resolve_interfaces(&["lo".to_string()]);
+        assert!(result.contains(&"lo".to_string()), "lo must be in /sys/class/net");
+    }
+
+    #[test]
+    fn resolve_star_includes_lo() {
+        let result = resolve_interfaces(&["*".to_string()]);
+        assert!(result.contains(&"lo".to_string()));
+    }
+
+    #[test]
+    fn resolve_no_match() {
+        let result = resolve_interfaces(&["__no_such_iface__".to_string()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_sorted() {
+        let result = resolve_interfaces(&["*".to_string()]);
+        let mut sorted = result.clone();
+        sorted.sort_unstable();
+        assert_eq!(result, sorted, "resolve_interfaces must return sorted names");
+    }
+
+    #[test]
+    fn resolve_multiple_patterns() {
+        // "lo" exact + "*" wildcard — no duplicates expected from real /sys/class/net
+        // because HashSet dedup is not used; but sorted uniqueness: lo appears once.
+        let result = resolve_interfaces(&["lo".to_string(), "*".to_string()]);
+        let lo_count = result.iter().filter(|n| n.as_str() == "lo").count();
+        // With `any()` filtering each name once, lo appears exactly once.
+        assert_eq!(lo_count, 1);
+    }
 }

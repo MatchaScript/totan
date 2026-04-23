@@ -48,19 +48,24 @@ impl PacketInterceptor {
 
     #[cfg(feature = "ebpf")]
     async fn run_ebpf(self, connection_manager: Arc<ConnectionManager>) -> Result<()> {
-        use crate::ebpf::Loader;
+        use crate::ebpf::{resolve_interfaces, Loader};
         use std::net::Ipv4Addr;
 
-        let ingress_iface = self
-            .config
-            .ebpf
-            .ingress_interface
-            .as_deref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "`ebpf.ingress_interface` must be set when interception_mode = ebpf"
-                )
-            })?;
+        let patterns = self.config.ebpf.ingress_interfaces.clone();
+        if patterns.is_empty() {
+            anyhow::bail!(
+                "`ebpf.ingress_interfaces` must not be empty when interception_mode = ebpf"
+            );
+        }
+
+        let initial_ifaces = resolve_interfaces(&patterns);
+        if initial_ifaces.is_empty() {
+            anyhow::bail!(
+                "No interfaces matched {:?} — check `ebpf.ingress_interfaces`",
+                patterns
+            );
+        }
+
         let tproxy_port = self
             .config
             .ebpf
@@ -76,13 +81,18 @@ impl PacketInterceptor {
             tproxy_port
         );
 
-        // Loader is held inside this future; dropping it on shutdown detaches
-        // the tc program and releases the map.
         let fwmark = self.config.ebpf.fwmark;
-        let _loader =
-            Loader::load_and_attach(ingress_iface, Ipv4Addr::LOCALHOST, tproxy_port, fwmark)?;
+        let iface_refs: Vec<&str> = initial_ifaces.iter().map(String::as_str).collect();
+        let mut loader =
+            Loader::load_and_attach(&iface_refs, Ipv4Addr::LOCALHOST, tproxy_port, fwmark)?;
 
-        accept_loop(listener, connection_manager, OriginalDstSource::SkAssign).await
+        // Run the accept loop and the interface watcher concurrently.
+        // When the accept loop exits (shutdown or error) the select cancels the
+        // watcher, which drops `loader` and detaches all tc programs.
+        tokio::select! {
+            result = accept_loop(listener, connection_manager, OriginalDstSource::SkAssign) => result,
+            _ = watch_new_interfaces(&patterns, &mut loader, initial_ifaces) => Ok(()),
+        }
     }
 }
 
@@ -171,6 +181,33 @@ fn so_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
         stream
             .peer_addr()
             .map_err(|e| anyhow::anyhow!("Cannot get original destination: {}", e))
+    }
+}
+
+/// Poll `/sys/class/net` every 5 seconds for interfaces that match `patterns`
+/// but haven't been attached yet, and attach on discovery.
+/// Never returns; cancelled by `tokio::select!` on shutdown.
+#[cfg(feature = "ebpf")]
+async fn watch_new_interfaces(
+    patterns: &[String],
+    loader: &mut crate::ebpf::Loader,
+    initial: Vec<String>,
+) {
+    use crate::ebpf::resolve_interfaces;
+    use std::collections::HashSet;
+
+    let mut attached: HashSet<String> = initial.into_iter().collect();
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    interval.tick().await; // skip the immediate first tick
+    loop {
+        interval.tick().await;
+        for iface in resolve_interfaces(patterns) {
+            if attached.insert(iface.clone()) {
+                if let Err(e) = loader.attach_interface(&iface) {
+                    tracing::warn!("Failed to attach to new interface {}: {}", iface, e);
+                }
+            }
+        }
     }
 }
 
