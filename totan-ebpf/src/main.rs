@@ -72,12 +72,12 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
     // Copy out the packed field before comparing — taking &eth.ether_type
     // on a #[repr(C, packed)] struct is UB under rustc ≥ 1.94 (E0793).
     let ether_type = eth.ether_type;
-    if ether_type != EtherType::Ipv4 {
+    if ether_type != EtherType::Ipv4.into() {
         return Ok(TC_ACT_OK as i32);
     }
 
     let ipv4: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
-    if ipv4.proto != IpProto::Tcp {
+    if ipv4.proto != IpProto::Tcp.into() {
         return Ok(TC_ACT_OK as i32);
     }
 
@@ -88,7 +88,7 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
     }
 
     let tcp: TcpHdr = ctx.load(EthHdr::LEN + Ipv4Hdr::LEN).map_err(|_| ())?;
-    let dst_port = u16::from_be(tcp.dest);
+    let dst_port = u16::from_be_bytes(tcp.dest);
     if dst_port != 80 && dst_port != 443 {
         return Ok(TC_ACT_OK as i32);
     }

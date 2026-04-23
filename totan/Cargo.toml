@@ -33,7 +33,7 @@ hyper = { version = "1", features = ["http1", "client", "server"] }
 hyper-util = { version = "0.1", features = ["client", "server", "http1", "client-legacy"] }
 http-body-util = "0.1"
 http = "1.3"
-pingora = { version = "0.7.0", features = ["proxy"] }
+pingora = { version = "0.8.0", features = ["proxy"] }
 async-trait = "0.1"
 # Only HTTP proxying in Phase 1; disable default TLS features to avoid OpenSSL build dependency.
 bytes = "1"
