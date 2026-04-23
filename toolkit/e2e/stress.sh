@@ -108,7 +108,7 @@ client_idle_secs    = 30
 TOML
 
 if [[ "$MODE" == "ebpf" ]]; then
-    printf '[ebpf]\ningress_interface = "veth-st-host"\n' >> "$TOTAN_CFG"
+    printf '[ebpf]\ningress_interfaces = ["veth-st-host"]\n' >> "$TOTAN_CFG"
 fi
 
 # ── interception setup ────────────────────────────────────────────────────────

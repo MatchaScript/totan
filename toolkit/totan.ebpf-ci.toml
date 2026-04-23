@@ -29,7 +29,7 @@ try_direct_on_proxy_failure = false
 [ebpf]
 # Host side of the veth pair carrying pod traffic — the tc ingress classifier
 # picks up pod-originated SYNs here and sk_assigns them to the TPROXY listener.
-ingress_interface = "veth-host"
+ingress_interfaces = ["veth-host"]
 tproxy_port = 3129
 # Set on sk_assign'd packets; the loader installs
 # `ip rule fwmark <N> lookup 100` + `ip route local 0.0.0.0/0 dev lo table 100`

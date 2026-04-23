@@ -61,6 +61,7 @@ async fn test_proxy_flow_simulated() {
         Some(proxy_url),
         1000,
         ErrorMitigationConfig::default(),
+        0,
     )
     .unwrap();
 
@@ -120,6 +121,7 @@ async fn test_socks5_flow_simulated() {
         Some(proxy_url),
         1000,
         ErrorMitigationConfig::default(),
+        0,
     )
     .unwrap();
 
@@ -178,6 +180,7 @@ async fn test_handle_connection_https_407_is_error() {
         Some(proxy_url),
         1000,
         ErrorMitigationConfig::default(),
+        0,
     )
     .unwrap();
 
@@ -218,6 +221,7 @@ async fn test_handle_connection_http_end_to_end() {
         Some(proxy_url),
         1000,
         ErrorMitigationConfig::default(),
+        0,
     )
     .unwrap();
 
