@@ -6,16 +6,43 @@ listen_port = 3129
 # The default upstream proxy URL (corresponds to --proxy).
 default_proxy = "http://proxy.example.com:8080"
 
-# PAC location (file path or URL) for dynamic proxy resolution (corresponds to --pac-location).
+# PAC file path for dynamic proxy resolution (corresponds to --pac-file).
+# When set, totan evaluates FindProxyForURL(url, host) for every intercepted
+# connection. Return values:
+#   "PROXY host:port"  → forward through that HTTP proxy
+#   "SOCKS5 host:port" → forward through that SOCKS5 proxy
+#   "DIRECT"           → connect directly (no proxy)
+#
+# Enterprise example — Teams/O365 split-tunnelling:
+#   function FindProxyForURL(url, host) {
+#     if (shExpMatch(host, "*.teams.microsoft.com") ||
+#         shExpMatch(host, "*.office365.com") ||
+#         shExpMatch(host, "*.sharepoint.com")) {
+#       return "DIRECT";
+#     }
+#     return "PROXY proxy.corp.example:8080";
+#   }
 pac_location = "/etc/totan/config.pac"
 
-# Packet interception mode: "netfilter" or "ebpf" (corresponds to --mode).
+# Packet interception mode: "netfilter" or "ebpf".
+#
+# netfilter — Intercepts traffic via nftables/iptables hooks (OUTPUT for host
+#   processes, PREROUTING for forwarded/container traffic). Works for both
+#   programs running on the host AND container workloads.
+#   Nftables redirect rules must be configured separately, e.g.:
+#     nft add rule ip totan output meta skuid 1000 tcp dport {80,443} redirect to :3129
+#
+# ebpf      — Attaches a tc ingress BPF program (via tcx) to a named network
+#   interface — typically the host-side veth peer of a container/pod. Intercepts
+#   traffic arriving FROM containers at that interface.
+#
+#   ⚠ ebpf mode cannot intercept host-originated traffic. The kernel restricts
+#     bpf_sk_assign to tc ingress; traffic from host processes exits through
+#     tc egress and is invisible to this hook. If you need to proxy programs
+#     running on the host itself, use netfilter instead.
+#
+#   Requires: Linux kernel ≥ 6.6 (tcx multi-prog support), CAP_NET_ADMIN + CAP_BPF.
 interception_mode = "netfilter"
-
-# When interception_mode = "netfilter", choose backend: "iptables" or "nftables".
-# Default is "iptables".　
-# currently useless to generate config script
-netfilter_backend = "iptables"
 
 [logging]
 # Log level: "trace", "debug", "info", "warn", or "error".
@@ -28,3 +55,21 @@ format = "json"
 upstream_connect_ms = 3000
 # Client connection idle timeout in seconds.
 client_idle_secs = 600
+
+# ── eBPF-specific settings (only apply when interception_mode = "ebpf") ───────
+[ebpf]
+# Host-side network interface where container/pod traffic arrives.
+# For a Kubernetes pod this is the host-side end of the pod's veth pair
+# (e.g. "vethXXXXXX"); for a Docker bridge network it is the bridge uplink.
+ingress_interface = "veth-host"
+
+# Port for the IP_TRANSPARENT TPROXY listener. Defaults to listen_port.
+# Override when the TPROXY socket needs a different port from the netfilter
+# listener (e.g. to avoid conflicts in dual-mode deployments).
+# tproxy_port = 3129
+
+# fwmark placed on intercepted packets for policy routing. The value triggers
+# `ip rule fwmark <N> lookup 100` so the kernel delivers marked packets locally
+# rather than forwarding them. Default: 0x7474 ("tt" for totan).
+# Avoid Cilium's reserved range (0x0200–0x0E00).
+# fwmark = 0x7474

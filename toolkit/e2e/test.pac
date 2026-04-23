@@ -15,5 +15,10 @@ function FindProxyForURL(url, host) {
     if (shExpMatch(host, "b-*")) {
         return "PROXY 127.0.0.1:8882";
     }
+    // For plain HTTP totan passes the raw destination IP as host (no SNI).
+    // Route 192.0.2.14 to proxy-a to exercise the IP-based HTTP routing path.
+    if (host === "192.0.2.14") {
+        return "PROXY 127.0.0.1:8881";
+    }
     return "PROXY 127.0.0.1:8880";
 }

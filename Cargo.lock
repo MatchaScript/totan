@@ -1653,6 +1653,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e0b564323a0fb6d54b864f625ae139de9612e27edb944dda37c109f05aac531"
+dependencies = [
+ "hashbrown 0.17.0",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1994,7 +2003,7 @@ dependencies = [
  "httpdate",
  "indexmap 1.9.3",
  "log",
- "lru",
+ "lru 0.16.4",
  "once_cell",
  "parking_lot",
  "pingora-core",
@@ -2115,7 +2124,7 @@ checksum = "a1a89f8d8d48caadb7f711227e0754bac6495dd2d4ee03137cc2c6d46c3b0a9d"
 dependencies = [
  "crossbeam-queue",
  "log",
- "lru",
+ "lru 0.16.4",
  "parking_lot",
  "pingora-timeout",
  "thread_local",
@@ -2998,6 +3007,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "lru 0.17.0",
  "nix 0.30.1",
  "once_cell",
  "pingora",

@@ -19,6 +19,7 @@ httparse = { workspace = true }
 socket2 = { workspace = true }
 nix = { workspace = true, features = ["socket", "net"] }
 boa_engine = { workspace = true }
+lru = { workspace = true }
 once_cell = { workspace = true }
 totan-common = { path = "../totan-common" }
 

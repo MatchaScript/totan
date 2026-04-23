@@ -23,10 +23,12 @@
 #              uplink egress.
 #
 # Scenario layout (host→target mapping via curl --resolve, all in TEST-NET):
-#   plain.test       → 192.0.2.10  port 80  (plain HTTP, default proxy)
+#   plain.test       → 192.0.2.10  port 80  (plain HTTP, PAC default → proxy-default)
 #   a-site.test      → 192.0.2.11  port 443 (HTTPS, PAC routes to proxy-a)
 #   b-site.test      → 192.0.2.12  port 443 (HTTPS, PAC routes to proxy-b)
 #   other.test       → 192.0.2.13  port 443 (HTTPS, PAC default → proxy-default)
+#   192.0.2.14       →             port 80  (plain HTTP, PAC IP-routes to proxy-a)
+#   other.test       → 192.0.2.2x  port 443 (concurrent ×5, all → proxy-default)
 #
 # TEST-NET (192.0.2.0/24) is RFC 5737 documentation space: unreachable, so a
 # successful response proves totan actually proxied the flow.

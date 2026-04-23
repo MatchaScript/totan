@@ -1,26 +1,26 @@
 use anyhow::Result;
 use boa_engine::{Context, Source};
+use lru::LruCache;
 use std::{
-    collections::{HashMap, VecDeque},
+    num::NonZeroUsize,
     path::Path,
     sync::Mutex,
     time::{Duration, Instant},
 };
 use tokio::fs;
+use tokio::time::timeout;
 use totan_common::{PacResult, TotanError};
 use tracing::{debug, info};
 
 pub struct PacEngine {
     script_content: String,
     cache: Mutex<PacCache>,
+    pac_timeout: Duration,
 }
 
 struct PacCache {
     ttl: Duration,
-    max_entries: usize,
-    // Keyed by (url, host) joined with '\u0001' to avoid collision
-    map: HashMap<String, (Instant, Option<String>)>,
-    order: VecDeque<String>, // simple LRU order: front = oldest
+    lru: LruCache<(String, String), (Instant, Option<String>)>,
 }
 
 impl PacEngine {
@@ -28,55 +28,56 @@ impl PacEngine {
         let script_content = fs::read_to_string(pac_file).await?;
         info!("Loaded PAC file: {}", pac_file.display());
 
-        // Validate PAC script by creating a test context
         let mut context = Context::default();
         let source = Source::from_bytes(&script_content);
         context
             .eval(source)
             .map_err(|e| TotanError::PacScript(format!("PAC script validation failed: {}", e)))?;
 
-        // Defaults until wired by caller via builder-like methods
         let cache = PacCache {
             ttl: Duration::from_secs(60),
-            max_entries: 4096,
-            map: HashMap::new(),
-            order: VecDeque::new(),
+            lru: LruCache::new(NonZeroUsize::new(4096).unwrap()),
         };
         Ok(Self {
             script_content,
             cache: Mutex::new(cache),
+            pac_timeout: Duration::from_secs(30),
         })
     }
 
     pub fn with_cache(self, ttl_secs: u64, max_entries: usize) -> Self {
         let mut guard = self.cache.lock().unwrap();
         guard.ttl = Duration::from_secs(ttl_secs);
-        guard.max_entries = max_entries.max(1);
+        guard.lru.resize(NonZeroUsize::new(max_entries.max(1)).unwrap());
         drop(guard);
         self
     }
 
+    pub fn with_pac_timeout(mut self, secs: u64) -> Self {
+        self.pac_timeout = Duration::from_secs(secs);
+        self
+    }
+
     pub async fn find_proxy_for_url(&self, url: &str, host: &str) -> Result<Option<String>> {
-        // Check cache first
-        let key = format!("{url}\u{0001}{host}");
+        let key = (url.to_string(), host.to_string());
         let now = Instant::now();
+
+        // Check cache
         if let Some(hit) = {
             let mut guard = self.cache.lock().unwrap();
             if guard.ttl.as_secs() > 0 {
-                if let Some((ts, val)) = guard.map.get(&key) {
-                    if now.duration_since(*ts) <= guard.ttl {
+                let cached = guard.lru.peek(&key).map(|(ts, val)| (*ts, val.clone()));
+                match cached {
+                    Some((ts, val)) if now.duration_since(ts) <= guard.ttl => {
+                        guard.lru.get(&key); // promote to MRU
                         debug!("PAC cache hit: {} (host: {})", url, host);
-                        Some(val.clone())
-                    } else {
-                        // stale -> remove
-                        guard.map.remove(&key);
-                        if let Some(pos) = guard.order.iter().position(|k| k == &key) {
-                            guard.order.remove(pos);
-                        }
+                        Some(val)
+                    }
+                    Some(_) => {
+                        guard.lru.pop(&key);
                         None
                     }
-                } else {
-                    None
+                    None => None,
                 }
             } else {
                 None
@@ -85,24 +86,20 @@ impl PacEngine {
             return Ok(hit);
         }
 
-        // Execute PAC script in isolated context
         let script_content = self.script_content.clone();
         let url_val = url.to_string();
         let host_val = host.to_string();
 
-        let result = tokio::task::spawn_blocking(move || -> Result<String> {
+        let join_result = timeout(self.pac_timeout, tokio::task::spawn_blocking(move || -> Result<String> {
             let mut context = Context::default();
 
-            // Register PAC helpers
             Self::register_helpers(&mut context)?;
 
-            // Evaluate user script
             let source = Source::from_bytes(&script_content);
             context.eval(source).map_err(|e| {
                 TotanError::PacScript(format!("PAC script evaluation failed: {}", e))
             })?;
 
-            // Try to call FindProxyForURL
             let find_proxy = context
                 .global_object()
                 .get(boa_engine::JsString::from("FindProxyForURL"), &mut context)
@@ -138,12 +135,13 @@ impl PacEngine {
             })?;
 
             Ok(result_str.to_std_string_escaped())
-        })
-        .await??;
+        }))
+        .await
+        .map_err(|_| anyhow::anyhow!("PAC script execution timed out"))?;
+        let result = join_result??;
 
         debug!("PAC result for {} ({}): {}", url, host, result);
 
-        // Parse PAC result and return first valid proxy
         let pac_results = PacResult::parse(&result);
         let computed = pac_results
             .into_iter()
@@ -155,21 +153,10 @@ impl PacEngine {
             .next()
             .flatten();
 
-        // Save to cache
         {
             let mut guard = self.cache.lock().unwrap();
             if guard.ttl.as_secs() > 0 {
-                // Evict if over capacity
-                if guard.map.len() >= guard.max_entries {
-                    if let Some(old_key) = guard.order.pop_front() {
-                        guard.map.remove(&old_key);
-                    }
-                }
-                if let Some(pos) = guard.order.iter().position(|k| k == &key) {
-                    guard.order.remove(pos);
-                }
-                guard.order.push_back(key.clone());
-                guard.map.insert(key, (now, computed.clone()));
+                guard.lru.put(key, (now, computed.clone()));
             }
         }
 
@@ -177,7 +164,6 @@ impl PacEngine {
     }
 
     fn register_helpers(context: &mut Context) -> Result<()> {
-        // DNS helpers using Rust bindings
         use boa_engine::native_function::NativeFunction;
         use std::net::ToSocketAddrs;
 
@@ -208,12 +194,19 @@ impl PacEngine {
             _args: &[boa_engine::JsValue],
             _context: &mut Context,
         ) -> boa_engine::JsResult<boa_engine::JsValue> {
-            Ok(boa_engine::JsValue::from(boa_engine::JsString::from(
-                "127.0.0.1",
-            )))
+            // Use a UDP connect (no packets sent) to discover the outbound local IP
+            use std::net::UdpSocket;
+            let ip = UdpSocket::bind("0.0.0.0:0")
+                .ok()
+                .and_then(|sock| {
+                    sock.connect("8.8.8.8:80").ok()?;
+                    sock.local_addr().ok()
+                })
+                .map(|addr| addr.ip().to_string())
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            Ok(boa_engine::JsValue::from(boa_engine::JsString::from(ip)))
         }
 
-        // dnsResolve(host)
         context
             .register_global_builtin_callable(
                 "dnsResolve".into(),
@@ -222,7 +215,6 @@ impl PacEngine {
             )
             .map_err(|e| TotanError::PacScript(format!("Failed to register dnsResolve: {}", e)))?;
 
-        // myIpAddress()
         context
             .register_global_builtin_callable(
                 "myIpAddress".into(),
@@ -231,7 +223,6 @@ impl PacEngine {
             )
             .map_err(|e| TotanError::PacScript(format!("Failed to register myIpAddress: {}", e)))?;
 
-        // Standard PAC JS helpers
         const JS_HELPERS: &str = r#"
             function isPlainHostName(h) { return h.indexOf('.') === -1; }
             function dnsDomainIs(h, d) { if (!h || !d) return false; return h === d || h.endsWith('.' + d); }
@@ -343,6 +334,189 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res2, Some("http://a.com:8080".to_string()));
+    }
+
+    // ── Enterprise PAC scenarios ──────────────────────────────────────────────
+
+    /// Teams / O365 / SharePoint style split-tunneling: cloud collaboration
+    /// endpoints go DIRECT while everything else is proxied. This is the most
+    /// common enterprise breakout pattern.
+    #[tokio::test]
+    async fn test_pac_direct_breakout_teams_style() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            r#"
+            function FindProxyForURL(url, host) {
+                // Real enterprise PAC must match both apex and subdomains.
+                if (host === "teams.microsoft.com" ||
+                    shExpMatch(host, "*.teams.microsoft.com") ||
+                    shExpMatch(host, "*.office365.com") ||
+                    host === "login.microsoftonline.com" ||
+                    shExpMatch(host, "*.sharepoint.com")) {
+                    return "DIRECT";
+                }
+                return "PROXY 127.0.0.1:8080";
+            }
+        "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+        let engine = PacEngine::new(file.path()).await.unwrap();
+
+        // Cloud collaboration → DIRECT (None)
+        for (url, host) in [
+            ("https://teams.microsoft.com/", "teams.microsoft.com"),
+            ("https://join.teams.microsoft.com/", "join.teams.microsoft.com"),
+            ("https://contoso.sharepoint.com/", "contoso.sharepoint.com"),
+            ("https://login.microsoftonline.com/", "login.microsoftonline.com"),
+            ("https://outlook.office365.com/", "outlook.office365.com"),
+        ] {
+            assert_eq!(
+                engine.find_proxy_for_url(url, host).await.unwrap(),
+                None,
+                "{host} should be DIRECT"
+            );
+        }
+
+        // Everything else → proxy
+        assert_eq!(
+            engine
+                .find_proxy_for_url("https://example.com/", "example.com")
+                .await
+                .unwrap(),
+            Some("http://127.0.0.1:8080".to_string())
+        );
+    }
+
+    /// Region-based multi-proxy routing: APAC, EU, and default proxy tiers.
+    #[tokio::test]
+    async fn test_pac_multi_proxy_by_region() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            r#"
+            function FindProxyForURL(url, host) {
+                if (shExpMatch(host, "*.jp") || shExpMatch(host, "*.cn") ||
+                    shExpMatch(host, "*.au") || shExpMatch(host, "*.sg")) {
+                    return "PROXY 127.0.0.1:8882";
+                }
+                if (shExpMatch(host, "*.de") || shExpMatch(host, "*.fr") ||
+                    shExpMatch(host, "*.uk") || shExpMatch(host, "*.nl")) {
+                    return "PROXY 127.0.0.1:8881";
+                }
+                return "PROXY 127.0.0.1:8880";
+            }
+        "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+        let engine = PacEngine::new(file.path()).await.unwrap();
+
+        let cases = [
+            ("https://example.jp/", "example.jp", "http://127.0.0.1:8882"),
+            ("https://example.cn/", "example.cn", "http://127.0.0.1:8882"),
+            ("https://example.au/", "example.au", "http://127.0.0.1:8882"),
+            ("https://example.de/", "example.de", "http://127.0.0.1:8881"),
+            ("https://example.fr/", "example.fr", "http://127.0.0.1:8881"),
+            ("https://example.com/", "example.com", "http://127.0.0.1:8880"),
+            ("https://example.org/", "example.org", "http://127.0.0.1:8880"),
+        ];
+        for (url, host, expected_proxy) in cases {
+            assert_eq!(
+                engine.find_proxy_for_url(url, host).await.unwrap(),
+                Some(expected_proxy.to_string()),
+                "{host} should use {expected_proxy}"
+            );
+        }
+    }
+
+    /// DIRECT results (None) must be cached the same as proxy results.
+    #[tokio::test]
+    async fn test_pac_direct_result_is_cached() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            r#"
+            function FindProxyForURL(url, host) {
+                if (shExpMatch(host, "*.direct.internal")) return "DIRECT";
+                return "PROXY 127.0.0.1:8080";
+            }
+        "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+        let engine = PacEngine::new(file.path())
+            .await
+            .unwrap()
+            .with_cache(60, 100);
+
+        let r1 = engine
+            .find_proxy_for_url("https://svc.direct.internal/", "svc.direct.internal")
+            .await
+            .unwrap();
+        assert_eq!(r1, None);
+
+        // Second call must hit the cache and return the same DIRECT decision.
+        let r2 = engine
+            .find_proxy_for_url("https://svc.direct.internal/", "svc.direct.internal")
+            .await
+            .unwrap();
+        assert_eq!(r2, None);
+    }
+
+    /// Mixed DIRECT + proxied traffic in the same session — the cache key is
+    /// a (url, host) tuple so distinct hosts must not share cache entries.
+    #[tokio::test]
+    async fn test_pac_cache_key_isolation() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            r#"
+            function FindProxyForURL(url, host) {
+                if (host === "direct.test") return "DIRECT";
+                return "PROXY 127.0.0.1:8080";
+            }
+        "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+        let engine = PacEngine::new(file.path())
+            .await
+            .unwrap()
+            .with_cache(60, 100);
+
+        let direct = engine
+            .find_proxy_for_url("https://direct.test/", "direct.test")
+            .await
+            .unwrap();
+        let proxied = engine
+            .find_proxy_for_url("https://other.test/", "other.test")
+            .await
+            .unwrap();
+
+        assert_eq!(direct, None, "direct.test must be DIRECT");
+        assert_eq!(
+            proxied,
+            Some("http://127.0.0.1:8080".to_string()),
+            "other.test must use proxy"
+        );
+
+        // Verify subsequent calls (cache hit) return the same decisions.
+        assert_eq!(
+            engine
+                .find_proxy_for_url("https://direct.test/", "direct.test")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            engine
+                .find_proxy_for_url("https://other.test/", "other.test")
+                .await
+                .unwrap(),
+            Some("http://127.0.0.1:8080".to_string())
+        );
     }
 
     #[tokio::test]

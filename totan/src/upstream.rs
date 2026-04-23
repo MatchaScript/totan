@@ -267,9 +267,25 @@ impl UpstreamHandler {
             upstream_stream
                 .write_all(connect_request.as_bytes())
                 .await?;
-            let mut response = [0u8; 2048];
-            let n = upstream_stream.read(&mut response).await?;
-            let response_str = String::from_utf8_lossy(&response[..n]);
+            // Read until \r\n\r\n so TCP-split responses are handled correctly.
+            let mut response = Vec::with_capacity(256);
+            let mut byte = [0u8; 1];
+            loop {
+                upstream_stream.read_exact(&mut byte).await.map_err(|e| {
+                    TotanError::UpstreamProxy(format!("Failed reading CONNECT response: {}", e))
+                })?;
+                response.push(byte[0]);
+                if response.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+                if response.len() > 8192 {
+                    return Err(TotanError::UpstreamProxy(
+                        "CONNECT response too large".to_string(),
+                    )
+                    .into());
+                }
+            }
+            let response_str = String::from_utf8_lossy(&response);
             if response_str.starts_with("HTTP/1.1 200") || response_str.starts_with("HTTP/1.0 200")
             {
                 debug!("HTTP proxy CONNECT successful");
@@ -726,5 +742,126 @@ mod tests {
             handler.handle_socks5_proxy_impl(conn, &mut client, &mut upstream),
         )
         .await;
+    }
+
+    // ── CONNECT response robustness ───────────────────────────────────────────
+
+    /// A real upstream proxy (Squid, nginx, corporate gateway) typically adds
+    /// extra headers after the 200 status line before the blank line:
+    ///
+    ///   HTTP/1.1 200 Connection established\r\n
+    ///   Proxy-Agent: Squid\r\n
+    ///   \r\n
+    ///
+    /// The response can also arrive in multiple TCP segments. Our byte-by-byte
+    /// read loop must consume exactly up to \r\n\r\n and hand the tunnel to
+    /// copy_bidirectional without discarding or leaking any bytes.
+    #[tokio::test]
+    async fn test_connect_response_with_extra_headers() {
+        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default()).unwrap();
+        let (mut client, client_mock) = tokio::io::duplex(4096);
+        let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
+
+        let mut conn = test_conn();
+        conn.original_dest = "93.184.216.34:443".parse().unwrap();
+        conn.sni_hostname = Some("example.com".to_string());
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            upstream_mock.read(&mut buf).await.unwrap();
+
+            // Simulate a Squid-style multi-header CONNECT response arriving in
+            // two separate writes (TCP segment split after the status line).
+            upstream_mock
+                .write_all(b"HTTP/1.1 200 Connection established\r\n")
+                .await
+                .unwrap();
+            upstream_mock
+                .write_all(b"Proxy-Agent: Squid/5.7\r\nDate: Mon, 01 Jan 2024 00:00:00 GMT\r\n\r\n")
+                .await
+                .unwrap();
+
+            drop(upstream_mock);
+        });
+
+        // Drop client_mock immediately so copy_bidirectional terminates as
+        // soon as the CONNECT response is consumed and the tunnel opens.
+        drop(client_mock);
+
+        // Should succeed: 200 response even with extra headers and TCP split.
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            handler.handle_http_proxy_impl(conn, &mut client, &mut upstream),
+        )
+        .await;
+        assert!(result.is_ok(), "timed out waiting for CONNECT to complete");
+    }
+
+    /// Upstream proxy requires authentication (407). totan must surface this as
+    /// an error and not attempt to tunnel into the 407 response body.
+    #[tokio::test]
+    async fn test_connect_rejected_407() {
+        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default()).unwrap();
+        let (mut client, _client_mock) = tokio::io::duplex(4096);
+        let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
+
+        let mut conn = test_conn();
+        conn.original_dest = "93.184.216.34:443".parse().unwrap();
+        conn.sni_hostname = Some("example.com".to_string());
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            upstream_mock.read(&mut buf).await.unwrap();
+            upstream_mock
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                      Proxy-Authenticate: Basic realm=\"corporate-proxy\"\r\n\
+                      Content-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            drop(upstream_mock);
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            handler.handle_http_proxy_impl(conn, &mut client, &mut upstream),
+        )
+        .await
+        .expect("timed out");
+
+        assert!(result.is_err(), "407 must be returned as an error");
+    }
+
+    /// Corporate proxies that forward to a second-tier proxy may reject with
+    /// 403 Forbidden when the target is not in the allow-list.
+    #[tokio::test]
+    async fn test_connect_rejected_403() {
+        let handler = UpstreamHandler::new(None, 1000, ErrorMitigationConfig::default()).unwrap();
+        let (mut client, _client_mock) = tokio::io::duplex(4096);
+        let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
+
+        let mut conn = test_conn();
+        conn.original_dest = "93.184.216.34:443".parse().unwrap();
+        conn.sni_hostname = Some("blocked.example.com".to_string());
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            upstream_mock.read(&mut buf).await.unwrap();
+            upstream_mock
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            drop(upstream_mock);
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            handler.handle_http_proxy_impl(conn, &mut client, &mut upstream),
+        )
+        .await
+        .expect("timed out");
+
+        assert!(result.is_err(), "403 must be returned as an error");
     }
 }

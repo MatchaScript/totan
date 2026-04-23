@@ -5,10 +5,31 @@ use tokio::net::TcpStream;
 
 /// Extract SNI hostname from TLS ClientHello message
 pub async fn extract_sni_hostname(stream: &mut TcpStream) -> Result<String> {
-    let mut buf = [0u8; 1024];
+    // 4096 bytes covers even large ClientHellos with many extensions.
+    let mut buf = [0u8; 4096];
 
-    // Peek at the first packet to extract SNI
-    let n = stream.peek(&mut buf).await?;
+    // Peek in a loop: the ClientHello may arrive in multiple TCP segments.
+    // Stop as soon as we have the full TLS record or give up after a few
+    // retries (in practice one or two peeks are always enough).
+    let n = {
+        let mut n = stream.peek(&mut buf).await?;
+        for _ in 0..8 {
+            if n < 5 {
+                n = stream.peek(&mut buf).await?;
+                continue;
+            }
+            if buf[0] != 0x16 || buf[1] != 0x03 {
+                break; // Not TLS; let the check below produce the error.
+            }
+            let record_length = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+            let needed = 5 + record_length;
+            if needed > buf.len() || n >= needed {
+                break; // Record fits in buffer and we have it all (or it's too large).
+            }
+            n = stream.peek(&mut buf).await?;
+        }
+        n
+    };
 
     if n < 5 {
         return Err(anyhow::anyhow!("Not enough data for TLS handshake"));
@@ -22,7 +43,11 @@ pub async fn extract_sni_hostname(stream: &mut TcpStream) -> Result<String> {
     // Parse TLS record length
     let record_length = u16::from_be_bytes([buf[3], buf[4]]) as usize;
 
-    if n < 5 + record_length.min(n - 5) {
+    if 5 + record_length > buf.len() {
+        return Err(anyhow::anyhow!("TLS record too large for SNI extraction"));
+    }
+
+    if 5 + record_length > n {
         return Err(anyhow::anyhow!("Incomplete TLS record"));
     }
 

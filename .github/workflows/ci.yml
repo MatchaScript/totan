@@ -119,3 +119,46 @@ jobs:
           uname -r | awk -F. '{exit !(($1 > 6) || ($1 == 6 && $2 >= 6))}'
       - name: Run eBPF e2e
         run: sudo --preserve-env=PATH bash toolkit/e2e/run.sh ebpf
+
+  # ── stress / performance tests ────────────────────────────────────────────────
+  # Only runs on push to main so PR feedback stays fast.
+  # Thresholds can be overridden via env: TOTAN_STRESS_MIN_RPS, TOTAN_STRESS_MAX_FAIL_PCT.
+  stress-netfilter:
+    name: Stress (netfilter)
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push'
+    needs: build-netfilter
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: totan-netfilter-release
+          path: target/release/
+      - name: Make totan executable
+        run: chmod +x target/release/totan
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y nftables apache2-utils
+      - name: Run netfilter stress test
+        run: sudo --preserve-env=PATH bash toolkit/e2e/stress.sh netfilter
+
+  stress-ebpf:
+    name: Stress (eBPF)
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push'
+    needs: build-ebpf
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: totan-ebpf-release
+          path: target/release/
+      - name: Make totan executable
+        run: chmod +x target/release/totan
+      - name: Verify kernel version
+        run: |
+          echo "kernel: $(uname -r)"
+          uname -r | awk -F. '{exit !(($1 > 6) || ($1 == 6 && $2 >= 6))}'
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y apache2-utils
+      - name: Run eBPF stress test
+        run: sudo --preserve-env=PATH bash toolkit/e2e/stress.sh ebpf

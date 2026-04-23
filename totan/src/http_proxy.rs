@@ -113,7 +113,9 @@ impl ProxyHttp for TotanHttpProxy {
         upstream_request.set_uri(new_uri);
 
         // Ensure Host header is correctly set
-        upstream_request.insert_header("Host", host).unwrap();
+        upstream_request.insert_header("Host", host).map_err(|e| {
+            pingora::Error::explain(pingora::ErrorType::InternalError, e.to_string())
+        })?;
 
         Ok(())
     }
