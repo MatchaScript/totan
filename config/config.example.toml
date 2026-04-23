@@ -58,20 +58,19 @@ client_idle_secs = 600
 
 # ── Netfilter-specific settings (only apply when interception_mode = "netfilter") ─
 [netfilter]
-# UIDs whose outbound TCP traffic on redirect_ports is transparently redirected
-# to totan's listener via an nftables OUTPUT hook. totan creates and removes the
-# nftables table automatically on startup/shutdown.
+# Set to true to let totan manage nftables rules automatically.
+# When true, totan installs an OUTPUT nat hook that redirects ALL outbound TCP
+# traffic on redirect_ports to its listener, automatically excluding its own UID
+# to prevent redirect loops. Rules are removed on shutdown.
 #
-# When empty (the default), totan does NOT touch nftables — configure redirect
-# rules externally, e.g.:
-#   nft add rule ip filter output meta skuid 1000 tcp dport {80,443} redirect to :3129
-#
-# Example: proxy traffic from uid 1000 (your user account)
-# redirect_uids = [1000]
-#
-# Example: proxy traffic from a dedicated service account (uid 500)
-# redirect_uids = [500]
-redirect_uids = []
+# When false (default), totan does not touch nftables — configure rules
+# externally (e.g. via system nftables config, Ansible, or manually).
+manage_rules = false
+
+# Additional UIDs whose traffic bypasses the proxy entirely.
+# totan's own UID is always excluded automatically; list here any other
+# processes that must not be intercepted (e.g. system daemons, monitoring).
+# exclude_uids = [0]   # exclude root
 
 # TCP destination ports to intercept. Default: [80, 443].
 redirect_ports = [80, 443]

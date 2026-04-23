@@ -1,12 +1,12 @@
 //! Automatic nftables rule management for netfilter interception mode.
 //!
 //! [`NetfilterManager::setup`] installs a `table ip totan` with an OUTPUT
-//! nat hook that redirects matching UIDs' TCP traffic to totan's listener.
-//! The rules are removed when the [`NetfilterManager`] is dropped, so Ctrl-C
-//! or a normal process exit always leaves the system clean.
+//! nat hook that redirects **all** outbound TCP traffic on the configured
+//! ports to totan's listener, excluding totan's own UID (auto-detected) to
+//! prevent redirect loops and any additional UIDs listed in `exclude_uids`.
 //!
-//! If `redirect_uids` is empty the caller should manage nftables rules
-//! externally; `setup` returns `None` in that case.
+//! Rules are removed when [`NetfilterManager`] is dropped, so Ctrl-C or a
+//! normal process exit always leaves the system clean.
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -23,20 +23,26 @@ const TABLE: &str = "totan";
 pub struct NetfilterManager;
 
 impl NetfilterManager {
-    /// Install redirect rules for the given configuration.
+    /// Install redirect rules.
     ///
-    /// Returns `None` when `cfg.redirect_uids` is empty (caller manages rules).
+    /// Returns `None` when `cfg.manage_rules` is false (caller manages rules).
     pub fn setup(listen_port: u16, cfg: &NetfilterConfig) -> Result<Option<Self>> {
-        if cfg.redirect_uids.is_empty() {
+        if !cfg.manage_rules {
             return Ok(None);
         }
 
-        let uid_set = cfg
-            .redirect_uids
+        let own_uid = nix::unistd::getuid().as_raw();
+
+        // Build the exclude set: totan's own UID + any user-specified UIDs.
+        let mut excluded: Vec<u32> = vec![own_uid];
+        excluded.extend_from_slice(&cfg.exclude_uids);
+        excluded.dedup();
+        let exclude_set = excluded
             .iter()
             .map(|u| u.to_string())
             .collect::<Vec<_>>()
             .join(", ");
+
         let port_set = cfg
             .redirect_ports
             .iter()
@@ -44,23 +50,25 @@ impl NetfilterManager {
             .collect::<Vec<_>>()
             .join(", ");
 
-        // Remove any stale table left by a previous crash before creating ours.
+        // Remove any stale table left by a previous crash, then create fresh.
         nft(&format!("delete table ip {TABLE}")).ok();
 
         nft(&format!(
             "table ip {TABLE} {{\
              \n\tchain output {{\
              \n\t\ttype nat hook output priority -100; policy accept;\
-             \n\t\tmeta skuid {{ {uid_set} }} tcp dport {{ {port_set} }} redirect to :{listen_port}\
+             \n\t\tmeta skuid {{ {exclude_set} }} return\
+             \n\t\ttcp dport {{ {port_set} }} redirect to :{listen_port}\
              \n\t}}\
              \n}}"
         ))?;
 
         info!(
-            uids = ?cfg.redirect_uids,
+            own_uid,
+            exclude_uids = ?excluded,
             ports = ?cfg.redirect_ports,
             listen_port,
-            "nftables redirect rules installed"
+            "nftables redirect rules installed (all traffic except excluded UIDs)"
         );
         Ok(Some(Self))
     }
@@ -75,7 +83,6 @@ impl Drop for NetfilterManager {
     }
 }
 
-/// Feed `script` to `nft -f -` via stdin.
 fn nft(script: &str) -> Result<()> {
     let mut child = Command::new("nft")
         .args(["-f", "-"])

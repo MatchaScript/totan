@@ -166,13 +166,19 @@ impl Default for TotanConfig {
 /// Netfilter-mode rule management configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetfilterConfig {
-    /// UIDs whose outbound TCP traffic on `redirect_ports` is transparently
-    /// redirected to totan's listener via an nftables OUTPUT rule.
+    /// When `true`, totan installs nftables OUTPUT rules that redirect **all**
+    /// outbound TCP traffic on `redirect_ports` to its listener, automatically
+    /// excluding its own UID to prevent redirect loops.
     ///
-    /// When empty totan does **not** touch nftables — configure redirect rules
+    /// When `false` (default), totan does not touch nftables — manage rules
     /// externally (e.g. via a system nftables config or Ansible).
     #[serde(default)]
-    pub redirect_uids: Vec<u32>,
+    pub manage_rules: bool,
+
+    /// Additional UIDs to exclude from redirection (e.g. system daemons that
+    /// must bypass the proxy). totan's own UID is always excluded automatically.
+    #[serde(default)]
+    pub exclude_uids: Vec<u32>,
 
     /// TCP destination ports to intercept. Default: [80, 443].
     #[serde(default = "default_redirect_ports")]
