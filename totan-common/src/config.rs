@@ -2,9 +2,14 @@ use crate::types::InterceptionMode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn default_listen_port() -> u16 {
+    3129
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TotanConfig {
     /// The local port for totan to listen on
+    #[serde(default = "default_listen_port")]
     pub listen_port: u16,
 
     /// The default upstream proxy URL

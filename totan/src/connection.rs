@@ -133,7 +133,6 @@ impl ConnectionManager {
                 intercepted_conn,
                 stream,
                 upstream_proxy,
-                // If PAC is configured, do not fall back to default proxy when it says DIRECT
                 self.pac_engine.is_none(),
             )
             .await

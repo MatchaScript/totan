@@ -130,7 +130,9 @@ async fn accept_loop(
             }
             Err(e) => {
                 error!("Failed to accept connection: {}", e);
-                continue;
+                // Back off briefly to avoid spinning at 100% CPU on persistent
+                // errors such as EMFILE (too many open files).
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }
     }

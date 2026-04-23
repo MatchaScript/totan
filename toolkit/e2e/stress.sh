@@ -140,6 +140,8 @@ else  # ebpf
     ip netns exec "$POD_NS" ip addr add 10.101.0.2/24 dev veth-st-pod
     ip netns exec "$POD_NS" ip route add default via 10.101.0.1
     ip netns exec "$POD_NS" sysctl -qw net.ipv4.tcp_tw_reuse=1
+    ip netns exec "$POD_NS" sysctl -qw net.ipv4.tcp_fin_timeout=5
+    ip netns exec "$POD_NS" sysctl -qw net.ipv4.ip_local_port_range="1024 65535"
 
     AB_PREFIX=(ip netns exec "$POD_NS")
 fi
@@ -216,9 +218,9 @@ run_bench() {
 
 # ── benchmarks ────────────────────────────────────────────────────────────────
 run_bench "moderate"   500  10   # baseline throughput
-sleep 1
+sleep 3
 run_bench "sustained" 2000  20   # sustained mixed load (before burst to avoid state accumulation)
-sleep 1
+sleep 3
 run_bench "burst"     1000  50   # high concurrency spike
 
 # ── verdict ───────────────────────────────────────────────────────────────────

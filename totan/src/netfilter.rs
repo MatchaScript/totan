@@ -87,18 +87,20 @@ fn nft(script: &str) -> Result<()> {
     let mut child = Command::new("nft")
         .args(["-f", "-"])
         .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn nft: {e}"))?;
 
     child
         .stdin
-        .as_mut()
+        .take()
         .expect("stdin is piped")
         .write_all(script.as_bytes())?;
 
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(anyhow::anyhow!("nft script failed:\n{script}"));
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("nft script failed:\n{script}\n{stderr}"));
     }
     Ok(())
 }
