@@ -99,4 +99,16 @@ mod tests {
             _ => panic!("Expected Netfilter mode"),
         }
     }
+
+    #[test]
+    fn test_interception_mode_arg_from() {
+        let netfilter_mode: totan_common::InterceptionMode = InterceptionModeArg::Netfilter.into();
+        assert_eq!(netfilter_mode, totan_common::InterceptionMode::Netfilter);
+
+        #[cfg(feature = "ebpf")]
+        {
+            let ebpf_mode: totan_common::InterceptionMode = InterceptionModeArg::Ebpf.into();
+            assert_eq!(ebpf_mode, totan_common::InterceptionMode::Ebpf);
+        }
+    }
 }
