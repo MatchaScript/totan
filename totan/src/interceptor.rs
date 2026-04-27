@@ -58,7 +58,7 @@ impl PacketInterceptor {
             );
         }
 
-        let initial_ifaces = resolve_interfaces(&patterns);
+        let initial_ifaces = resolve_interfaces(&patterns).await;
         if initial_ifaces.is_empty() {
             anyhow::bail!(
                 "No interfaces matched {:?} — check `ebpf.ingress_interfaces`",
@@ -201,7 +201,7 @@ async fn watch_new_interfaces(
     interval.tick().await; // skip the immediate first tick
     loop {
         interval.tick().await;
-        for iface in resolve_interfaces(patterns) {
+        for iface in resolve_interfaces(patterns).await {
             if attached.insert(iface.clone()) {
                 if let Err(e) = loader.attach_interface(&iface) {
                     tracing::warn!("Failed to attach to new interface {}: {}", iface, e);
