@@ -367,7 +367,7 @@ impl PacEvaluator {
             _worker: worker,
             cache: Mutex::new(PacCache {
                 ttl: Duration::from_secs(60),
-                lru: LruCache::new(NonZeroUsize::new(4096).unwrap()),
+                lru: LruCache::new(NonZeroUsize::new(4096).expect("4096 is non-zero")),
             }),
             pac_timeout: Duration::from_secs(30),
         })
@@ -376,7 +376,8 @@ impl PacEvaluator {
     pub fn with_cache(self, ttl_secs: u64, max_entries: usize) -> Self {
         let mut g = self.cache.lock().unwrap();
         g.ttl = Duration::from_secs(ttl_secs);
-        g.lru.resize(NonZeroUsize::new(max_entries.max(1)).unwrap());
+        g.lru
+            .resize(NonZeroUsize::new(max_entries.max(1)).expect("max(1) is non-zero"));
         drop(g);
         self
     }
@@ -684,4 +685,3 @@ mod tests {
         assert!(err.is_err(), "syntactically broken PAC must fail to load");
     }
 }
-
