@@ -242,19 +242,22 @@ fn run_cmd(args: &[&str]) -> anyhow::Result<std::process::ExitStatus> {
 /// Enumerate `/sys/class/net` and return all interface names that match at
 /// least one of the given patterns. Patterns support `*` (any sequence) and
 /// `?` (any single character); a pattern with no wildcards is an exact match.
-pub fn resolve_interfaces(patterns: &[String]) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
-        return vec![];
+pub async fn resolve_interfaces(patterns: &[String]) -> Vec<String> {
+    let mut entries = match tokio::fs::read_dir("/sys/class/net").await {
+        Ok(entries) => entries,
+        Err(_) => return vec![],
     };
-    let mut matched: Vec<String> = entries
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|name| {
-            patterns
-                .iter()
-                .any(|p| glob_match(p.as_bytes(), name.as_bytes()))
-        })
-        .collect();
+
+    let mut matched: Vec<String> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if patterns
+            .iter()
+            .any(|p| glob_match(p.as_bytes(), name.as_bytes()))
+        {
+            matched.push(name);
+        }
+    }
     matched.sort_unstable();
     matched
 }
@@ -323,31 +326,31 @@ mod tests {
         assert!(!m("l*x*", "eth0"));
     }
 
-    #[test]
-    fn resolve_lo_exact() {
+    #[tokio::test]
+    async fn resolve_lo_exact() {
         // `lo` is present on every Linux host; sanity-check resolve_interfaces.
-        let result = resolve_interfaces(&["lo".to_string()]);
+        let result = resolve_interfaces(&["lo".to_string()]).await;
         assert!(
             result.contains(&"lo".to_string()),
             "lo must be in /sys/class/net"
         );
     }
 
-    #[test]
-    fn resolve_star_includes_lo() {
-        let result = resolve_interfaces(&["*".to_string()]);
+    #[tokio::test]
+    async fn resolve_star_includes_lo() {
+        let result = resolve_interfaces(&["*".to_string()]).await;
         assert!(result.contains(&"lo".to_string()));
     }
 
-    #[test]
-    fn resolve_no_match() {
-        let result = resolve_interfaces(&["__no_such_iface__".to_string()]);
+    #[tokio::test]
+    async fn resolve_no_match() {
+        let result = resolve_interfaces(&["__no_such_iface__".to_string()]).await;
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn resolve_sorted() {
-        let result = resolve_interfaces(&["*".to_string()]);
+    #[tokio::test]
+    async fn resolve_sorted() {
+        let result = resolve_interfaces(&["*".to_string()]).await;
         let mut sorted = result.clone();
         sorted.sort_unstable();
         assert_eq!(
@@ -356,11 +359,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_multiple_patterns() {
+    #[tokio::test]
+    async fn resolve_multiple_patterns() {
         // "lo" exact + "*" wildcard — no duplicates expected from real /sys/class/net
         // because HashSet dedup is not used; but sorted uniqueness: lo appears once.
-        let result = resolve_interfaces(&["lo".to_string(), "*".to_string()]);
+        let result = resolve_interfaces(&["lo".to_string(), "*".to_string()]).await;
         let lo_count = result.iter().filter(|n| n.as_str() == "lo").count();
         // With `any()` filtering each name once, lo appears exactly once.
         assert_eq!(lo_count, 1);
