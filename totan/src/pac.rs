@@ -376,7 +376,10 @@ impl PacEvaluator {
     pub fn with_cache(self, ttl_secs: u64, max_entries: usize) -> Self {
         let mut g = self.cache.lock().unwrap();
         g.ttl = Duration::from_secs(ttl_secs);
-        g.lru.resize(NonZeroUsize::new(max_entries.max(1)).unwrap());
+        g.lru.resize(
+            NonZeroUsize::new(max_entries.max(1))
+                .expect("max_entries.max(1) is guaranteed to be non-zero"),
+        );
         drop(g);
         self
     }
@@ -684,4 +687,3 @@ mod tests {
         assert!(err.is_err(), "syntactically broken PAC must fail to load");
     }
 }
-
