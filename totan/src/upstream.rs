@@ -78,15 +78,11 @@ impl UpstreamHandler {
 
         for entry in &proxies {
             // Pingora path: client stream is consumed, no failover possible.
-            if intercepted_conn.original_dest.port() != 443 {
-                if let ProxyOrDirect::Proxy(Proxy::Http(ep)) = entry {
-                    let proxy_url = format!("http://{}", ep);
-                    let ctx = HttpProxyContext::new(
-                        intercepted_conn.clone(),
-                        &proxy_url,
-                        self.upstream_mark,
-                    )?;
-                    return serve_http_connection(client_stream, ctx).await;
+            if let ProxyOrDirect::Proxy(Proxy::Http(ep)) = entry {
+                if intercepted_conn.original_dest.port() != 443 {
+                    return self
+                        .serve_http_via_pingora(&intercepted_conn, client_stream, ep)
+                        .await;
                 }
             }
 
@@ -168,6 +164,17 @@ impl UpstreamHandler {
     async fn connect_to_proxy(&self, ep: &HostAndPort) -> Result<TcpStream> {
         let addr = ep.to_string();
         self.connect_with_retry(addr.as_str(), "proxy").await
+    }
+
+    async fn serve_http_via_pingora(
+        &self,
+        intercepted: &InterceptedConnection,
+        stream: TcpStream,
+        ep: &HostAndPort,
+    ) -> Result<()> {
+        let proxy_url = format!("http://{}", ep);
+        let ctx = HttpProxyContext::new(intercepted.clone(), &proxy_url, self.upstream_mark)?;
+        serve_http_connection(stream, ctx).await
     }
 
     async fn connect_with_retry<A>(&self, addr: A, what: &str) -> Result<TcpStream>
@@ -255,10 +262,8 @@ impl UpstreamHandler {
             .unwrap_or_else(|| intercepted.original_dest.ip().to_string());
         let authority = format!("{}:{}", authority_host, intercepted.original_dest.port());
         debug!("HTTP proxy CONNECT to {}", authority);
-        let connect_request = format!(
-            "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n",
-            authority, authority
-        );
+
+        let connect_request = build_http_connect_request(&authority);
         upstream_stream
             .write_all(connect_request.as_bytes())
             .await?;
@@ -316,44 +321,7 @@ impl UpstreamHandler {
 
         // 2) CONNECT request: prefer the hostname (via SNI) so the proxy can
         // do its own resolution; fall back to the IP when there is no name.
-        let mut req: Vec<u8> = Vec::with_capacity(32);
-        req.push(0x05);
-        req.push(0x01);
-        req.push(0x00);
-        if let Some(host) = &intercepted.sni_hostname {
-            debug!(
-                "SOCKS5 CONNECT to {}:{}",
-                host,
-                intercepted.original_dest.port()
-            );
-            let host_bytes = host.as_bytes();
-            let len = host_bytes.len().min(255);
-            req.push(0x03);
-            req.push(len as u8);
-            req.extend_from_slice(&host_bytes[..len]);
-        } else {
-            match intercepted.original_dest.ip() {
-                std::net::IpAddr::V4(v4) => {
-                    debug!(
-                        "SOCKS5 CONNECT to {}:{}",
-                        v4,
-                        intercepted.original_dest.port()
-                    );
-                    req.push(0x01);
-                    req.extend_from_slice(&v4.octets());
-                }
-                std::net::IpAddr::V6(v6) => {
-                    debug!(
-                        "SOCKS5 CONNECT to {}:{}",
-                        v6,
-                        intercepted.original_dest.port()
-                    );
-                    req.push(0x04);
-                    req.extend_from_slice(&v6.octets());
-                }
-            }
-        }
-        req.extend_from_slice(&intercepted.original_dest.port().to_be_bytes());
+        let req = build_socks5_connect_request(intercepted);
         upstream_stream.write_all(&req).await?;
         upstream_stream.flush().await?;
 
@@ -443,6 +411,58 @@ async fn tcp_connect_marked<A: tokio::net::ToSocketAddrs>(
         }
     }
     Err(last_err)
+}
+
+fn build_http_connect_request(authority: &str) -> String {
+    format!(
+        "CONNECT {authority} HTTP/1.1\r\n\
+         Host: {authority}\r\n\
+         Proxy-Connection: keep-alive\r\n\
+         Connection: keep-alive\r\n\r\n"
+    )
+}
+
+fn build_socks5_connect_request(intercepted: &InterceptedConnection) -> Vec<u8> {
+    let mut req: Vec<u8> = Vec::with_capacity(32);
+    req.push(0x05); // Version 5
+    req.push(0x01); // CONNECT command
+    req.push(0x00); // Reserved
+
+    if let Some(host) = &intercepted.sni_hostname {
+        debug!(
+            "SOCKS5 CONNECT to {}:{}",
+            host,
+            intercepted.original_dest.port()
+        );
+        let host_bytes = host.as_bytes();
+        let len = host_bytes.len().min(255);
+        req.push(0x03); // ATYP: DOMAINNAME
+        req.push(len as u8);
+        req.extend_from_slice(&host_bytes[..len]);
+    } else {
+        match intercepted.original_dest.ip() {
+            std::net::IpAddr::V4(v4) => {
+                debug!(
+                    "SOCKS5 CONNECT to {}:{}",
+                    v4,
+                    intercepted.original_dest.port()
+                );
+                req.push(0x01); // ATYP: IP V4 address
+                req.extend_from_slice(&v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                debug!(
+                    "SOCKS5 CONNECT to {}:{}",
+                    v6,
+                    intercepted.original_dest.port()
+                );
+                req.push(0x04); // ATYP: IP V6 address
+                req.extend_from_slice(&v6.octets());
+            }
+        }
+    }
+    req.extend_from_slice(&intercepted.original_dest.port().to_be_bytes());
+    req
 }
 
 #[cfg(test)]
