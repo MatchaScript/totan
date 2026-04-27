@@ -4,6 +4,10 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct CliArgs {
+    /// Address to listen on
+    #[arg(long)]
+    pub listen_addr: Option<String>,
+
     /// Port to listen on
     #[arg(short, long)]
     pub port: Option<u16>,

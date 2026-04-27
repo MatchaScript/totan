@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TotanConfig {
+    /// The local address for totan to listen on
+    #[serde(default = "default_listen_addr")]
+    pub listen_addr: String,
+
     /// The local port for totan to listen on
     pub listen_port: u16,
 
@@ -101,6 +105,7 @@ fn default_client_idle_secs() -> u64 {
 impl Default for TotanConfig {
     fn default() -> Self {
         Self {
+            listen_addr: default_listen_addr(),
             listen_port: 3129,
             default_proxy: None,
             pac_file: None,
@@ -163,4 +168,8 @@ fn default_pac_cache_ttl_secs() -> u64 {
 }
 fn default_pac_cache_max_entries() -> usize {
     4096
+}
+
+fn default_listen_addr() -> String {
+    "127.0.0.1".to_string()
 }

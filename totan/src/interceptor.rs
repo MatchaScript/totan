@@ -8,12 +8,17 @@ use crate::connection::ConnectionManager;
 
 pub struct PacketInterceptor {
     mode: InterceptionMode,
+    listen_addr: String,
     port: u16,
 }
 
 impl PacketInterceptor {
-    pub fn new(mode: InterceptionMode, port: u16) -> Result<Self> {
-        Ok(Self { mode, port })
+    pub fn new(mode: InterceptionMode, listen_addr: String, port: u16) -> Result<Self> {
+        Ok(Self {
+            mode,
+            listen_addr,
+            port,
+        })
     }
 
     pub async fn run(self, connection_manager: Arc<ConnectionManager>) -> Result<()> {
@@ -25,8 +30,11 @@ impl PacketInterceptor {
     }
 
     async fn run_netfilter(self, connection_manager: Arc<ConnectionManager>) -> Result<()> {
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", self.port)).await?;
-        info!("Netfilter interceptor listening on port {}", self.port);
+        let listener = TcpListener::bind(format!("{}:{}", self.listen_addr, self.port)).await?;
+        info!(
+            "Netfilter interceptor listening on {}:{}",
+            self.listen_addr, self.port
+        );
 
         loop {
             match listener.accept().await {

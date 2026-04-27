@@ -27,7 +27,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Create packet interceptor based on mode
-    let interceptor = PacketInterceptor::new(config.interception_mode, config.listen_port)?;
+    let interceptor =
+        PacketInterceptor::new(config.interception_mode, config.listen_addr.clone(), config.listen_port)?;
     info!(
         "Packet interceptor initialized in {:?} mode",
         config.interception_mode
@@ -89,6 +90,10 @@ fn load_config(args: &CliArgs) -> anyhow::Result<TotanConfig> {
     };
 
     // Override config with CLI arguments
+    if let Some(addr) = &args.listen_addr {
+        config.listen_addr = addr.clone();
+    }
+
     if let Some(port) = args.port {
         config.listen_port = port;
     }
