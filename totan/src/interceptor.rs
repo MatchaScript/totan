@@ -48,6 +48,7 @@ impl PacketInterceptor {
 
     #[cfg(feature = "ebpf")]
     async fn run_ebpf(self, connection_manager: Arc<ConnectionManager>) -> Result<()> {
+        use crate::cgroup::HostLoader;
         use crate::ebpf::{resolve_interfaces, Loader};
         use std::net::Ipv4Addr;
 
@@ -75,7 +76,7 @@ impl PacketInterceptor {
         // Bind the TPROXY listener *before* attaching the eBPF program so
         // packets that arrive between attach and bind don't hit a "socket not
         // found" path.
-        let listener = bind_tproxy_listener(Ipv4Addr::LOCALHOST, tproxy_port)?;
+        let tproxy_listener = bind_tproxy_listener(Ipv4Addr::LOCALHOST, tproxy_port)?;
         info!(
             "TPROXY listener (IP_TRANSPARENT) on 127.0.0.1:{}",
             tproxy_port
@@ -83,21 +84,54 @@ impl PacketInterceptor {
 
         let fwmark = self.config.ebpf.fwmark;
         let iface_refs: Vec<&str> = initial_ifaces.iter().map(String::as_str).collect();
-        let mut loader =
+        let mut tc_loader =
             Loader::load_and_attach(&iface_refs, Ipv4Addr::LOCALHOST, tproxy_port, fwmark)?;
 
-        // Run the accept loop and the interface watcher concurrently.
-        // When the accept loop exits (shutdown or error) the select cancels the
-        // watcher, which drops `loader` and detaches all tc programs.
-        tokio::select! {
-            result = accept_loop(listener, connection_manager, OriginalDstSource::SkAssign) => result,
-            _ = watch_new_interfaces(&patterns, &mut loader, initial_ifaces) => Ok(()),
+        // Optional cgroup host hooks: load only when the config opts in.
+        // Same lifecycle pattern — bind listener first, then attach BPF.
+        let host = match &self.config.ebpf.host_hooks {
+            Some(hh) => {
+                let host_listener =
+                    TcpListener::bind(format!("127.0.0.1:{}", hh.redirect_port)).await?;
+                info!(
+                    "Cgroup host-hook listener on 127.0.0.1:{}",
+                    hh.redirect_port
+                );
+                let loader = HostLoader::load_and_attach(
+                    &hh.slices,
+                    Ipv4Addr::LOCALHOST,
+                    hh.redirect_port,
+                )?;
+                let source = OriginalDstSource::CgroupSportMap(loader.sport_map());
+                Some((loader, host_listener, source))
+            }
+            None => None,
+        };
+
+        // Run the accept loop(s) and the interface watcher concurrently.
+        // When any branch exits (shutdown or error) the select cancels the
+        // others, which drops the loaders and detaches all programs.
+        match host {
+            Some((_host_loader, host_listener, host_source)) => {
+                let cm2 = Arc::clone(&connection_manager);
+                tokio::select! {
+                    result = accept_loop(tproxy_listener, connection_manager, OriginalDstSource::SkAssign) => result,
+                    result = accept_loop(host_listener, cm2, host_source) => result,
+                    _ = watch_new_interfaces(&patterns, &mut tc_loader, initial_ifaces) => Ok(()),
+                }
+            }
+            None => {
+                tokio::select! {
+                    result = accept_loop(tproxy_listener, connection_manager, OriginalDstSource::SkAssign) => result,
+                    _ = watch_new_interfaces(&patterns, &mut tc_loader, initial_ifaces) => Ok(()),
+                }
+            }
         }
     }
 }
 
 /// How to derive `original_dest` from an accepted connection.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum OriginalDstSource {
     /// Netfilter redirect: read `SO_ORIGINAL_DST` off the accepted socket.
     SoOriginalDst,
@@ -106,6 +140,11 @@ enum OriginalDstSource {
     /// (== `TcpStream::local_addr`) is authoritative.
     #[cfg(feature = "ebpf")]
     SkAssign,
+    /// Cgroup `connect4` rewrote the dst to a local port; the original dst
+    /// was stashed by `sockops` keyed by the ephemeral source port. Look it
+    /// up in the BPF map by `peer_addr.port().to_be()`.
+    #[cfg(feature = "ebpf")]
+    CgroupSportMap(crate::cgroup::SportMap),
 }
 
 async fn accept_loop(
@@ -117,9 +156,10 @@ async fn accept_loop(
         match listener.accept().await {
             Ok((stream, client_addr)) => {
                 let connection_manager = Arc::clone(&connection_manager);
+                let source = source.clone();
 
                 tokio::spawn(async move {
-                    let original_dest = match resolve_original_dest(&stream, source) {
+                    let original_dest = match resolve_original_dest(&stream, &source).await {
                         Ok(addr) => addr,
                         Err(e) => {
                             error!(
@@ -148,13 +188,36 @@ async fn accept_loop(
     }
 }
 
-fn resolve_original_dest(stream: &TcpStream, source: OriginalDstSource) -> Result<SocketAddr> {
+async fn resolve_original_dest(
+    stream: &TcpStream,
+    source: &OriginalDstSource,
+) -> Result<SocketAddr> {
     match source {
         OriginalDstSource::SoOriginalDst => so_original_dst(stream),
         #[cfg(feature = "ebpf")]
         OriginalDstSource::SkAssign => stream
             .local_addr()
             .map_err(|e| anyhow::anyhow!("getsockname() failed: {}", e)),
+        #[cfg(feature = "ebpf")]
+        OriginalDstSource::CgroupSportMap(map) => {
+            let peer = stream.peer_addr()?;
+            let sport_be = peer.port().to_be();
+            let mut guard = map.lock().await;
+            let od = guard.get(&sport_be, 0).map_err(|e| {
+                anyhow::anyhow!(
+                    "no original-dst entry for sport {} (cgroup hook race or non-hooked source?): {}",
+                    peer.port(),
+                    e
+                )
+            })?;
+            // Eager remove so the LRU stays warm with live entries.
+            // sock_release is the safety-net, not the primary cleanup.
+            let _ = guard.remove(&sport_be);
+            Ok(SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::from(u32::from_be(od.addr_be)),
+                u16::from_be(od.port_be),
+            )))
+        }
     }
 }
 
