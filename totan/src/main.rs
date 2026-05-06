@@ -103,6 +103,12 @@ fn load_config(args: &CliArgs) -> anyhow::Result<TotanConfig> {
     if let Some(mode) = &args.mode {
         config.interception_mode = mode.clone().into();
     }
+
+    // CLI flag turns on host hooks if config didn't already do so. The
+    // config can override the defaults; the flag is a quick on-switch.
+    if args.ebpf_host_hooks && config.ebpf.host_hooks.is_none() {
+        config.ebpf.host_hooks = Some(totan_common::config::HostHooksConfig::default());
+    }
     // Logging overrides
     if let Some(lvl) = &args.log_level {
         config.logging.level = lvl.clone();

@@ -39,6 +39,14 @@ pub struct CliArgs {
     /// Log format: text or json
     #[arg(long)]
     pub log_format: Option<String>,
+
+    /// Enable cgroup-based interception of host-originated traffic
+    /// (kubelet, containerd, dnf, etc.). Requires --mode ebpf.
+    /// When set, totan attaches `cgroup/connect4` + `sockops` BPF programs
+    /// to the slice paths in the [ebpf.host_hooks] config (or the defaults
+    /// if the section is absent).
+    #[arg(long, default_value_t = false)]
+    pub ebpf_host_hooks: bool,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -98,5 +106,17 @@ mod tests {
             Some(InterceptionModeArg::Netfilter) => (),
             _ => panic!("Expected Netfilter mode"),
         }
+    }
+
+    #[test]
+    fn test_cli_default_host_hooks_off() {
+        let args = CliArgs::try_parse_from(["totan"]).unwrap();
+        assert!(!args.ebpf_host_hooks);
+    }
+
+    #[test]
+    fn test_cli_parsing_host_hooks_flag() {
+        let args = CliArgs::try_parse_from(["totan", "--ebpf-host-hooks"]).unwrap();
+        assert!(args.ebpf_host_hooks);
     }
 }
