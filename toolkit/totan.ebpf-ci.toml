@@ -35,3 +35,11 @@ tproxy_port = 3129
 # `ip rule fwmark <N> lookup 100` + `ip route local 0.0.0.0/0 dev lo table 100`
 # so marked packets get delivered locally regardless of their dst IP.
 fwmark = 0x7474
+
+# Host-originated traffic (kubelet, dnf, anything not in a pod) is captured
+# via cgroup BPF hooks instead of tc ingress. The runner creates the slice
+# at /sys/fs/cgroup/totan-e2e.slice before totan starts, and host-side curls
+# are launched into it by writing $$ to cgroup.procs.
+[ebpf.host_hooks]
+redirect_port = 3130
+slices = ["/sys/fs/cgroup/totan-e2e.slice"]
