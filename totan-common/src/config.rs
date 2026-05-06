@@ -78,6 +78,55 @@ pub struct EbpfConfig {
     /// Default: 0x7474.
     #[serde(default = "default_fwmark")]
     pub fwmark: u32,
+
+    /// Optional host-process interception via cgroup BPF hooks
+    /// (`cgroup/connect4` + `sockops`). Disabled when absent.
+    /// See `HostHooksConfig` for details.
+    #[serde(default)]
+    pub host_hooks: Option<HostHooksConfig>,
+}
+
+/// Cgroup-based host egress interception. When present, totan loads
+/// `cgroup/connect4` + `sockops` BPF programs and attaches them to the
+/// listed cgroup paths. Connections from processes inside those cgroups
+/// (and their descendants) targeting TCP/80 or TCP/443 are redirected
+/// to `127.0.0.1:<redirect_port>`, where a plain TCP listener accepts
+/// them and recovers the original destination via a BPF map.
+///
+/// Pod traffic is **not** affected by this — pod processes live under
+/// `kubepods.slice`, deliberately omitted from the default slice list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostHooksConfig {
+    /// Local port for the cgroup-redirect listener. Must differ from the
+    /// TPROXY port used by tc ingress to keep accept loops separable.
+    #[serde(default = "default_host_redirect_port")]
+    pub redirect_port: u16,
+
+    /// cgroup v2 paths to attach to. Each path must exist and be a
+    /// directory under `/sys/fs/cgroup/`. Programs apply to the cgroup
+    /// itself and all descendants.
+    #[serde(default = "default_host_slices")]
+    pub slices: Vec<PathBuf>,
+}
+
+fn default_host_redirect_port() -> u16 {
+    3130
+}
+
+fn default_host_slices() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/sys/fs/cgroup/system.slice"),
+        PathBuf::from("/sys/fs/cgroup/user.slice"),
+    ]
+}
+
+impl Default for HostHooksConfig {
+    fn default() -> Self {
+        Self {
+            redirect_port: default_host_redirect_port(),
+            slices: default_host_slices(),
+        }
+    }
 }
 
 fn default_fwmark() -> u32 {
@@ -90,7 +139,48 @@ impl Default for EbpfConfig {
             ingress_interfaces: Vec::new(),
             tproxy_port: None,
             fwmark: default_fwmark(),
+            host_hooks: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod host_hooks_tests {
+    use super::*;
+
+    #[test]
+    fn ebpf_config_default_host_hooks_disabled() {
+        let cfg = EbpfConfig::default();
+        assert!(cfg.host_hooks.is_none(), "host_hooks must default to None");
+    }
+
+    #[test]
+    fn ebpf_config_parses_host_hooks_section() {
+        let toml_src = r#"
+            ingress_interfaces = ["lxc*"]
+            tproxy_port = 3129
+
+            [host_hooks]
+            redirect_port = 3130
+            slices = ["/sys/fs/cgroup/system.slice"]
+        "#;
+        let cfg: EbpfConfig = toml::from_str(toml_src).unwrap();
+        let hh = cfg.host_hooks.expect("host_hooks must parse");
+        assert_eq!(hh.redirect_port, 3130);
+        assert_eq!(hh.slices, vec![PathBuf::from("/sys/fs/cgroup/system.slice")]);
+    }
+
+    #[test]
+    fn host_hooks_config_default_slices() {
+        let hh = HostHooksConfig::default();
+        assert_eq!(
+            hh.slices,
+            vec![
+                PathBuf::from("/sys/fs/cgroup/system.slice"),
+                PathBuf::from("/sys/fs/cgroup/user.slice"),
+            ]
+        );
+        assert_eq!(hh.redirect_port, 3130);
     }
 }
 

@@ -11,3 +11,6 @@ ebpf = []
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }
