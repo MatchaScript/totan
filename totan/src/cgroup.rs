@@ -188,8 +188,7 @@ fn attach_connect4(
     prog.load()?;
     let mut links = Vec::with_capacity(slices.len());
     for slice in slices {
-        let f = File::open(slice)
-            .with_context(|| format!("opening cgroup {}", slice.display()))?;
+        let f = File::open(slice).with_context(|| format!("opening cgroup {}", slice.display()))?;
         let id = prog
             .attach(f, CgroupAttachMode::AllowMultiple)
             .with_context(|| format!("attaching connect4 to {}", slice.display()))?;
@@ -210,8 +209,7 @@ fn attach_sockops(
     prog.load()?;
     let mut links = Vec::with_capacity(slices.len());
     for slice in slices {
-        let f = File::open(slice)
-            .with_context(|| format!("opening cgroup {}", slice.display()))?;
+        let f = File::open(slice).with_context(|| format!("opening cgroup {}", slice.display()))?;
         let id = prog
             .attach(f, CgroupAttachMode::AllowMultiple)
             .with_context(|| format!("attaching sockops to {}", slice.display()))?;
@@ -232,8 +230,7 @@ fn attach_sock_release(
     prog.load()?;
     let mut links = Vec::with_capacity(slices.len());
     for slice in slices {
-        let f = File::open(slice)
-            .with_context(|| format!("opening cgroup {}", slice.display()))?;
+        let f = File::open(slice).with_context(|| format!("opening cgroup {}", slice.display()))?;
         let id = prog
             .attach(f, CgroupAttachMode::AllowMultiple)
             .with_context(|| format!("attaching sock_release to {}", slice.display()))?;

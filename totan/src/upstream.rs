@@ -507,7 +507,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_connect_tunnel() {
-        let handler = UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler =
+            UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
         let mut conn = test_conn();
@@ -537,7 +538,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_socks5_tunnel() {
-        let handler = UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler =
+            UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
         let mut conn = test_conn();
@@ -590,7 +592,10 @@ mod tests {
         )
         .await
         .expect("inner handshake timeout must fire before the outer guard");
-        assert!(res.is_err(), "a stalled proxy must surface as a handshake error");
+        assert!(
+            res.is_err(),
+            "a stalled proxy must surface as a handshake error"
+        );
     }
 
     /// SOCKS5 negotiation against a proxy that stalls mid-handshake must also
@@ -609,14 +614,18 @@ mod tests {
         )
         .await
         .expect("inner handshake timeout must fire before the outer guard");
-        assert!(res.is_err(), "a stalled SOCKS5 proxy must surface as an error");
+        assert!(
+            res.is_err(),
+            "a stalled SOCKS5 proxy must surface as an error"
+        );
     }
 
     /// Multi-header CONNECT response split across TCP segments must still
     /// be parsed correctly before handing off to the byte-pipe.
     #[tokio::test]
     async fn test_connect_response_with_extra_headers() {
-        let handler = UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler =
+            UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
         let mut conn = test_conn();
@@ -649,7 +658,8 @@ mod tests {
     /// 407 (proxy auth required) surfaces as an error, not a silent tunnel.
     #[tokio::test]
     async fn test_connect_rejected_407() {
-        let handler = UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler =
+            UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
         let mut conn = test_conn();
@@ -682,7 +692,8 @@ mod tests {
     /// 403 from a chained corporate proxy also surfaces as an error.
     #[tokio::test]
     async fn test_connect_rejected_403() {
-        let handler = UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler =
+            UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
         let mut conn = test_conn();

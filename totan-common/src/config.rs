@@ -176,7 +176,10 @@ mod host_hooks_tests {
         let cfg: EbpfConfig = toml::from_str(toml_src).unwrap();
         let hh = cfg.host_hooks.expect("host_hooks must parse");
         assert_eq!(hh.redirect_port, 3130);
-        assert_eq!(hh.slices, vec![PathBuf::from("/sys/fs/cgroup/system.slice")]);
+        assert_eq!(
+            hh.slices,
+            vec![PathBuf::from("/sys/fs/cgroup/system.slice")]
+        );
     }
 
     #[test]
@@ -413,8 +416,7 @@ mod config_example_tests {
 
     #[test]
     fn unknown_nested_key_is_rejected() {
-        let res: Result<TotanConfig, _> =
-            toml::from_str("[netfilter]\nexclude_uids = [0]\n");
+        let res: Result<TotanConfig, _> = toml::from_str("[netfilter]\nexclude_uids = [0]\n");
         assert!(
             res.is_err(),
             "unknown key in a nested section must be rejected"

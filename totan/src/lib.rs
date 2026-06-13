@@ -1,6 +1,6 @@
-pub mod cli;
 #[cfg(feature = "ebpf")]
 pub mod cgroup;
+pub mod cli;
 pub mod connection;
 #[cfg(feature = "ebpf")]
 pub mod ebpf;

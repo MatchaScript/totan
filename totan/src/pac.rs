@@ -743,8 +743,8 @@ mod tests {
             calls.set(calls.get() + 1);
             None::<String>
         };
-        assert_eq!(cache.lookup_with("nope.invalid", 1000, &fail), None);
-        assert_eq!(cache.lookup_with("nope.invalid", 1001, &fail), None);
+        assert_eq!(cache.lookup_with("nope.invalid", 1000, fail), None);
+        assert_eq!(cache.lookup_with("nope.invalid", 1001, fail), None);
         assert_eq!(
             calls.get(),
             2,
@@ -761,17 +761,21 @@ mod tests {
             Some("1.2.3.4".to_string())
         };
         assert_eq!(
-            cache.lookup_with("host.test", 1000, &ok).as_deref(),
+            cache.lookup_with("host.test", 1000, ok).as_deref(),
             Some("1.2.3.4")
         );
         assert_eq!(
             cache
-                .lookup_with("host.test", 1000 + DNS_ENTRY_TTL_SECS - 1, &ok)
+                .lookup_with("host.test", 1000 + DNS_ENTRY_TTL_SECS - 1, ok)
                 .as_deref(),
             Some("1.2.3.4")
         );
-        assert_eq!(calls.get(), 1, "a cached hit must not re-resolve within TTL");
-        let _ = cache.lookup_with("host.test", 1000 + DNS_ENTRY_TTL_SECS + 1, &ok);
+        assert_eq!(
+            calls.get(),
+            1,
+            "a cached hit must not re-resolve within TTL"
+        );
+        let _ = cache.lookup_with("host.test", 1000 + DNS_ENTRY_TTL_SECS + 1, ok);
         assert_eq!(calls.get(), 2, "the entry must re-resolve after the TTL");
     }
 
@@ -784,4 +788,3 @@ mod tests {
         assert!(err.is_err(), "syntactically broken PAC must fail to load");
     }
 }
-
