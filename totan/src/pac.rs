@@ -121,6 +121,13 @@ fn build_context() -> Context {
     )
     .expect("register myIpAddress");
 
+    js.register_global_builtin_callable(
+        js_string!("myIpAddressEx"),
+        0,
+        NativeFunction::from_fn_ptr(native_my_ip_address_ex),
+    )
+    .expect("register myIpAddressEx");
+
     // One shared DNS cache instance per Context, stashed on the global object
     // under `_dnsCache`. The native `dnsResolve` looks it up each call.
     let dns_cache_obj = js
@@ -147,7 +154,9 @@ type DnsMap = HashMap<String, DnsEntry>;
 
 #[derive(Debug, Trace, Finalize, JsData)]
 struct DnsEntry {
-    ip: Option<String>,
+    // Only successful resolutions are stored, so this is a plain `String`
+    // rather than `Option` — failures are never cached.
+    ip: String,
     // Absolute expiry (unix seconds). `u64` is Trace/Finalize-safe as a leaf.
     expires_at: u64,
 }
@@ -162,27 +171,39 @@ struct DnsCache {
 
 impl DnsCache {
     fn lookup(&mut self, host: &str) -> Option<String> {
-        let now = unix_now();
-        let expire_at = now + DNS_ENTRY_TTL_SECS;
+        self.lookup_with(host, unix_now(), resolve_host_blocking)
+    }
 
-        let resolved = match self.map.get(host) {
-            Some(entry) if entry.expires_at > now => entry.ip.clone(),
-            _ => {
-                let ip = resolve_host_blocking(host);
-                self.map.insert(
-                    host.to_string(),
-                    DnsEntry {
-                        ip: ip.clone(),
-                        expires_at: expire_at,
-                    },
-                );
-                ip
+    /// Cache logic split from the clock and the resolver so it can be tested
+    /// deterministically. Only successful resolutions are cached: a failed
+    /// lookup must not be remembered, or a transient DNS hiccup would blackhole
+    /// the host for the full TTL.
+    fn lookup_with(
+        &mut self,
+        host: &str,
+        now: u64,
+        resolve: impl Fn(&str) -> Option<String>,
+    ) -> Option<String> {
+        if let Some(entry) = self.map.get(host) {
+            if entry.expires_at > now {
+                return Some(entry.ip.clone());
             }
-        };
+        }
+
+        let resolved = resolve(host);
+        if let Some(ip) = &resolved {
+            self.map.insert(
+                host.to_string(),
+                DnsEntry {
+                    ip: ip.clone(),
+                    expires_at: now + DNS_ENTRY_TTL_SECS,
+                },
+            );
+        }
 
         if self.next_cleanup_at <= now {
             self.map.retain(|_, e| e.expires_at > now);
-            self.next_cleanup_at = expire_at;
+            self.next_cleanup_at = now + DNS_ENTRY_TTL_SECS;
         }
 
         resolved
@@ -279,28 +300,44 @@ fn native_sh_exp_match(_this: &JsValue, args: &[JsValue], _ctx: &mut Context) ->
     Ok(JsValue::from(matched))
 }
 
+/// Probe the primary outbound interface address once and cache it process-wide:
+/// totan's primary interface doesn't change over its lifetime, and the
+/// UDP-connect trick is a syscall cluster we'd rather not repeat on every PAC
+/// call. If the probe ever fails we still return something useful (127.0.0.1)
+/// so the PAC can fall through to a default.
+fn primary_ip() -> String {
+    static CACHED: OnceCell<String> = OnceCell::new();
+    CACHED
+        .get_or_init(|| {
+            use std::net::UdpSocket;
+            UdpSocket::bind("0.0.0.0:0")
+                .ok()
+                .and_then(|sock| {
+                    sock.connect("8.8.8.8:80").ok()?;
+                    sock.local_addr().ok()
+                })
+                .map(|addr| addr.ip().to_string())
+                .unwrap_or_else(|| "127.0.0.1".into())
+        })
+        .clone()
+}
+
 fn native_my_ip_address(
     _this: &JsValue,
     _args: &[JsValue],
     _ctx: &mut Context,
 ) -> JsResult<JsValue> {
-    // Process-wide cache: totan's primary interface doesn't change over its
-    // lifetime, and the UDP-connect trick is a syscall cluster we'd rather
-    // not repeat on every PAC call. If the probe ever fails we still return
-    // something useful (127.0.0.1) so the PAC can fall through to a default.
-    static CACHED: OnceCell<String> = OnceCell::new();
-    let ip = CACHED.get_or_init(|| {
-        use std::net::UdpSocket;
-        UdpSocket::bind("0.0.0.0:0")
-            .ok()
-            .and_then(|sock| {
-                sock.connect("8.8.8.8:80").ok()?;
-                sock.local_addr().ok()
-            })
-            .map(|addr| addr.ip().to_string())
-            .unwrap_or_else(|| "127.0.0.1".into())
-    });
-    Ok(JsValue::from(JsString::from(ip.clone())))
+    Ok(JsValue::from(JsString::from(primary_ip())))
+}
+
+fn native_my_ip_address_ex(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    // myIpAddressEx returns a semicolon-separated list; a single primary
+    // address is a valid response and mirrors myIpAddress's probe.
+    Ok(JsValue::from(JsString::from(primary_ip())))
 }
 
 // ─── Async facade: worker thread + LRU cache ─────────────────────────────
@@ -673,6 +710,69 @@ mod tests {
             .unwrap();
         assert_eq!(d1, d2);
         assert_eq!(p1, p2);
+    }
+
+    /// `myIpAddressEx` is part of the Microsoft PAC extension set; enterprise
+    /// PACs call it. It must be defined so a script using it doesn't throw and
+    /// silently fall back to DIRECT.
+    #[tokio::test]
+    async fn my_ip_address_ex_is_defined() {
+        let engine = engine_for(
+            r#"
+            function FindProxyForURL(url, host) {
+                var ip = myIpAddressEx();
+                return (typeof ip === "string" && ip.length > 0)
+                    ? "PROXY ok:80" : "DIRECT";
+            }
+            "#,
+        )
+        .await;
+        let p = engine.find_proxy("http://x/", "x").await;
+        assert!(p.is_ok(), "myIpAddressEx must be defined, not throw");
+        assert_eq!(
+            p.unwrap().first(),
+            &ProxyOrDirect::Proxy(Proxy::Http("ok:80".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn dns_failure_is_not_negatively_cached() {
+        let mut cache = DnsCache::default();
+        let calls = std::cell::Cell::new(0u32);
+        let fail = |_h: &str| {
+            calls.set(calls.get() + 1);
+            None::<String>
+        };
+        assert_eq!(cache.lookup_with("nope.invalid", 1000, &fail), None);
+        assert_eq!(cache.lookup_with("nope.invalid", 1001, &fail), None);
+        assert_eq!(
+            calls.get(),
+            2,
+            "a failed DNS lookup must be retried, not negatively cached"
+        );
+    }
+
+    #[test]
+    fn dns_success_is_cached_until_ttl_expires() {
+        let mut cache = DnsCache::default();
+        let calls = std::cell::Cell::new(0u32);
+        let ok = |_h: &str| {
+            calls.set(calls.get() + 1);
+            Some("1.2.3.4".to_string())
+        };
+        assert_eq!(
+            cache.lookup_with("host.test", 1000, &ok).as_deref(),
+            Some("1.2.3.4")
+        );
+        assert_eq!(
+            cache
+                .lookup_with("host.test", 1000 + DNS_ENTRY_TTL_SECS - 1, &ok)
+                .as_deref(),
+            Some("1.2.3.4")
+        );
+        assert_eq!(calls.get(), 1, "a cached hit must not re-resolve within TTL");
+        let _ = cache.lookup_with("host.test", 1000 + DNS_ENTRY_TTL_SECS + 1, &ok);
+        assert_eq!(calls.get(), 2, "the entry must re-resolve after the TTL");
     }
 
     /// A busted PAC should fail fast at load time, not at first request.

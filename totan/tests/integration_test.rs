@@ -41,7 +41,7 @@ async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
 #[tokio::test]
 async fn test_socks5_handshake_on_duplex() {
     let handler =
-        totan::upstream::UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
+        totan::upstream::UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
 
     let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
@@ -104,7 +104,7 @@ async fn test_handle_connection_https_407_is_error() {
     let proxy_url = format!("http://{}", proxy_addr);
     let proxies = proxies_from_url_str(&proxy_url).unwrap();
     let handler =
-        totan::upstream::UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
+        totan::upstream::UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
 
     let (totan_side, _test_client) = tcp_pair().await;
 
@@ -141,7 +141,7 @@ async fn test_handle_connection_http_end_to_end() {
     let proxy_url = format!("http://{}", proxy_addr);
     let proxies = proxies_from_url_str(&proxy_url).unwrap();
     let handler =
-        totan::upstream::UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
+        totan::upstream::UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
 
     let (totan_side, mut test_client) = tcp_pair().await;
 

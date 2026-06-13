@@ -7,6 +7,7 @@ fn default_listen_port() -> u16 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TotanConfig {
     /// The local port for totan to listen on
     #[serde(default = "default_listen_port")]
@@ -52,6 +53,7 @@ pub struct TotanConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EbpfConfig {
     /// Interface names or glob patterns (supports `*` and `?`) for the
     /// host-side peers of client network devices (veth / netkit). The tc
@@ -96,6 +98,7 @@ pub struct EbpfConfig {
 /// Pod traffic is **not** affected by this — pod processes live under
 /// `kubepods.slice`, deliberately omitted from the default slice list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostHooksConfig {
     /// Local port for the cgroup-redirect listener. Must differ from the
     /// TPROXY port used by tc ingress to keep accept loops separable.
@@ -185,6 +188,7 @@ mod host_hooks_tests {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Log level: "trace", "debug", "info", "warn", or "error"
     #[serde(default = "default_log_level")]
@@ -213,10 +217,17 @@ fn default_log_format() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeoutConfig {
     /// Upstream connection timeout in milliseconds
     #[serde(default = "default_upstream_connect_ms")]
     pub upstream_connect_ms: u64,
+
+    /// Deadline in milliseconds for negotiation reads that would otherwise block
+    /// indefinitely: client SNI/ClientHello sniffing and the upstream proxy
+    /// CONNECT / SOCKS5 handshake. Bounds slow-loris-style connection pinning.
+    #[serde(default = "default_handshake_ms")]
+    pub handshake_ms: u64,
 
     /// Client connection idle timeout in seconds
     #[serde(default = "default_client_idle_secs")]
@@ -227,6 +238,7 @@ impl Default for TimeoutConfig {
     fn default() -> Self {
         Self {
             upstream_connect_ms: default_upstream_connect_ms(),
+            handshake_ms: default_handshake_ms(),
             client_idle_secs: default_client_idle_secs(),
         }
     }
@@ -234,6 +246,10 @@ impl Default for TimeoutConfig {
 
 fn default_upstream_connect_ms() -> u64 {
     3000
+}
+
+fn default_handshake_ms() -> u64 {
+    5000
 }
 
 fn default_client_idle_secs() -> u64 {
@@ -260,6 +276,7 @@ impl Default for TotanConfig {
 
 /// Netfilter-mode rule management configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetfilterConfig {
     /// When `true`, totan installs nftables OUTPUT rules that redirect all
     /// outbound TCP traffic on `redirect_ports` to its listener. Packets marked
@@ -299,6 +316,7 @@ fn default_redirect_ports() -> Vec<u16> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorMitigationConfig {
     /// Number of retry attempts on upstream connect failures (0 = no retry)
     #[serde(default = "default_retry_attempts")]
@@ -346,4 +364,50 @@ fn default_pac_cache_ttl_secs() -> u64 {
 }
 fn default_pac_cache_max_entries() -> usize {
     4096
+}
+
+#[cfg(test)]
+mod config_example_tests {
+    use super::*;
+
+    fn example_toml() -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../config/config.example.toml");
+        std::fs::read_to_string(path).expect("read config.example.toml")
+    }
+
+    /// The shipped example must deserialize against the real schema, and the
+    /// settings it documents must actually take effect — a regression guard for
+    /// key-name drift (`pac_location` vs `pac_file`, singular `ingress_interface`).
+    #[test]
+    fn example_config_deserializes_and_fields_apply() {
+        let cfg: TotanConfig =
+            toml::from_str(&example_toml()).expect("example must deserialize against schema");
+        assert!(
+            cfg.pac_file.is_some(),
+            "documented PAC file must populate `pac_file`, not be silently dropped"
+        );
+        assert!(
+            !cfg.ebpf.ingress_interfaces.is_empty(),
+            "documented ingress interface must populate `ingress_interfaces`"
+        );
+    }
+
+    /// Unknown / mistyped keys must be a hard error instead of being silently
+    /// ignored, so config drift surfaces at load time.
+    #[test]
+    fn unknown_config_key_is_rejected() {
+        let res: Result<TotanConfig, _> =
+            toml::from_str("listen_port = 3129\nbogus_unknown_key = 42\n");
+        assert!(res.is_err(), "unknown top-level key must be rejected");
+    }
+
+    #[test]
+    fn unknown_nested_key_is_rejected() {
+        let res: Result<TotanConfig, _> =
+            toml::from_str("[netfilter]\nexclude_uids = [0]\n");
+        assert!(
+            res.is_err(),
+            "unknown key in a nested section must be rejected"
+        );
+    }
 }

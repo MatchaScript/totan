@@ -3,14 +3,15 @@ use std::io::ErrorKind;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-/// Extract SNI hostname from TLS ClientHello message
+/// Extract SNI hostname from a TLS ClientHello on `stream` (peeked, not consumed).
 pub async fn extract_sni_hostname(stream: &mut TcpStream) -> Result<String> {
-    // 4096 bytes covers even large ClientHellos with many extensions.
-    let mut buf = [0u8; 4096];
+    // 16 KiB matches Envoy's tls_inspector default max ClientHello size and
+    // covers post-quantum keyshares that overflow a 4 KiB buffer.
+    let mut buf = [0u8; 16384];
 
     // Peek in a loop: the ClientHello may arrive in multiple TCP segments.
-    // Stop as soon as we have the full TLS record or give up after a few
-    // retries (in practice one or two peeks are always enough).
+    // Stop once we have the whole record (or as much as will fit) or give up
+    // after a few retries.
     let n = {
         let mut n = stream.peek(&mut buf).await?;
         for _ in 0..8 {
@@ -19,105 +20,85 @@ pub async fn extract_sni_hostname(stream: &mut TcpStream) -> Result<String> {
                 continue;
             }
             if buf[0] != 0x16 || buf[1] != 0x03 {
-                break; // Not TLS; let the check below produce the error.
+                break; // Not TLS; let the parser produce the error.
             }
             let record_length = u16::from_be_bytes([buf[3], buf[4]]) as usize;
             let needed = 5 + record_length;
             if needed > buf.len() || n >= needed {
-                break; // Record fits in buffer and we have it all (or it's too large).
+                break; // We have it all, or it can't fully fit — parse what we have.
             }
             n = stream.peek(&mut buf).await?;
         }
         n
     };
 
+    extract_sni_from_bytes(&buf[..n])
+}
+
+/// Parse the SNI hostname out of the bytes of a (possibly truncated) TLS
+/// ClientHello. The record-length header is advisory: parsing keys off the
+/// bytes actually present, so an oversized ClientHello whose tail didn't fit or
+/// hasn't arrived still yields its SNI, which sits near the front.
+fn extract_sni_from_bytes(data: &[u8]) -> Result<String> {
+    let n = data.len();
     if n < 5 {
         return Err(anyhow::anyhow!("Not enough data for TLS handshake"));
     }
-
-    // Check if this is a TLS handshake (type 22, version 3.x)
-    if buf[0] != 0x16 || buf[1] != 0x03 {
+    // TLS handshake record (type 22, version 3.x).
+    if data[0] != 0x16 || data[1] != 0x03 {
         return Err(anyhow::anyhow!("Not a TLS handshake"));
     }
 
-    // Parse TLS record length
-    let record_length = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-
-    if 5 + record_length > buf.len() {
-        return Err(anyhow::anyhow!("TLS record too large for SNI extraction"));
-    }
-
-    if 5 + record_length > n {
-        return Err(anyhow::anyhow!("Incomplete TLS record"));
-    }
-
-    // Start parsing handshake message
-    let mut offset = 5; // Skip TLS record header
+    let mut offset = 5; // Skip TLS record header.
 
     if offset + 4 > n {
         return Err(anyhow::anyhow!("Incomplete handshake header"));
     }
-
-    // Check handshake type (should be 1 for ClientHello)
-    if buf[offset] != 0x01 {
+    // Handshake type 1 = ClientHello.
+    if data[offset] != 0x01 {
         return Err(anyhow::anyhow!("Not a ClientHello message"));
     }
-
-    // Skip handshake length (3 bytes)
-    offset += 4;
-
-    // Skip client version (2 bytes)
-    offset += 2;
+    offset += 4; // handshake type (1) + length (3)
+    offset += 2; // client version
 
     if offset + 32 > n {
         return Err(anyhow::anyhow!("Incomplete ClientHello"));
     }
-
-    // Skip client random (32 bytes)
-    offset += 32;
+    offset += 32; // client random
 
     if offset + 1 > n {
         return Err(anyhow::anyhow!("Missing session ID length"));
     }
-
-    // Skip session ID
-    let session_id_length = buf[offset] as usize;
+    let session_id_length = data[offset] as usize;
     offset += 1 + session_id_length;
 
     if offset + 2 > n {
         return Err(anyhow::anyhow!("Missing cipher suites length"));
     }
-
-    // Skip cipher suites
-    let cipher_suites_length = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
+    let cipher_suites_length = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
     offset += 2 + cipher_suites_length;
 
     if offset + 1 > n {
         return Err(anyhow::anyhow!("Missing compression methods length"));
     }
-
-    // Skip compression methods
-    let compression_methods_length = buf[offset] as usize;
+    let compression_methods_length = data[offset] as usize;
     offset += 1 + compression_methods_length;
 
     if offset + 2 > n {
         return Err(anyhow::anyhow!("Missing extensions length"));
     }
-
-    // Parse extensions
-    let extensions_length = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
+    let extensions_length = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
     offset += 2;
 
     let extensions_end = offset + extensions_length;
-
     while offset + 4 <= extensions_end && offset + 4 <= n {
-        let extension_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
-        let extension_length = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
+        let extension_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
+        let extension_length = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
         offset += 4;
 
-        // Check for SNI extension (type 0)
+        // SNI extension (type 0).
         if extension_type == 0 && offset + extension_length <= n {
-            return parse_sni_extension(&buf[offset..offset + extension_length]);
+            return parse_sni_extension(&data[offset..offset + extension_length]);
         }
 
         offset += extension_length;
@@ -179,6 +160,71 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal TLS ClientHello carrying a single SNI extension, with a
+    /// caller-chosen value in the record-length header (so we can simulate a
+    /// record whose declared length exceeds the bytes actually buffered).
+    fn client_hello_with_sni(sni: &str, declared_record_len: u16) -> Vec<u8> {
+        let name = sni.as_bytes();
+        // SNI extension data: server_name_list.
+        let mut ext_data = Vec::new();
+        ext_data.extend_from_slice(&((3 + name.len()) as u16).to_be_bytes()); // list len
+        ext_data.push(0x00); // name type = host_name
+        ext_data.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        ext_data.extend_from_slice(name);
+
+        // Extension TLV (type 0 = server_name).
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&0u16.to_be_bytes()); // ext type
+        extensions.extend_from_slice(&(ext_data.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&ext_data);
+
+        // Handshake body.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // client version
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session id len
+        body.extend_from_slice(&2u16.to_be_bytes()); // cipher suites len
+        body.extend_from_slice(&[0x00, 0x2f]); // one cipher suite
+        body.push(0x01); // compression methods len
+        body.push(0x00); // null compression
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        // Handshake header: type=ClientHello, 3-byte length.
+        let mut handshake = vec![0x01];
+        let hlen = body.len();
+        handshake.extend_from_slice(&[(hlen >> 16) as u8, (hlen >> 8) as u8, hlen as u8]);
+        handshake.extend_from_slice(&body);
+
+        // TLS record header with the *declared* (possibly inflated) length.
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&declared_record_len.to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn sni_extracted_from_well_formed_client_hello() {
+        let hello = client_hello_with_sni("example.com", 0);
+        // declared 0 is wrong on the wire, but parsing keys off available bytes.
+        let hello = {
+            let mut h = hello;
+            let real = (h.len() - 5) as u16;
+            h[3..5].copy_from_slice(&real.to_be_bytes());
+            h
+        };
+        assert_eq!(extract_sni_from_bytes(&hello).unwrap(), "example.com");
+    }
+
+    #[test]
+    fn sni_extracted_even_when_record_exceeds_available_bytes() {
+        // Declared record length is far larger than the bytes we provide, as
+        // happens when a large ClientHello (post-quantum keyshares) overflows
+        // the read buffer. SNI sits near the front and must still be parsed.
+        let hello = client_hello_with_sni("ex.com", 60000);
+        assert_eq!(extract_sni_from_bytes(&hello).unwrap(), "ex.com");
+    }
 
     #[test]
     fn test_parse_sni_extension() {

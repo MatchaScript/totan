@@ -40,6 +40,7 @@ impl std::fmt::Display for EstablishError {
 
 pub struct UpstreamHandler {
     connect_timeout: Duration,
+    handshake_timeout: Duration,
     mitigation: ErrorMitigationConfig,
     upstream_mark: u32,
 }
@@ -47,11 +48,13 @@ pub struct UpstreamHandler {
 impl UpstreamHandler {
     pub fn new(
         connect_timeout_ms: u64,
+        handshake_timeout_ms: u64,
         mitigation: ErrorMitigationConfig,
         upstream_mark: u32,
     ) -> Result<Self> {
         Ok(Self {
             connect_timeout: Duration::from_millis(connect_timeout_ms),
+            handshake_timeout: Duration::from_millis(handshake_timeout_ms),
             mitigation,
             upstream_mark,
         })
@@ -249,6 +252,28 @@ impl UpstreamHandler {
     where
         U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        match timeout(
+            self.handshake_timeout,
+            self.http_connect_negotiate(intercepted, upstream_stream),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(TotanError::UpstreamProxy(
+                "HTTP proxy CONNECT handshake timed out".to_string(),
+            )
+            .into()),
+        }
+    }
+
+    async fn http_connect_negotiate<U>(
+        &self,
+        intercepted: &InterceptedConnection,
+        upstream_stream: &mut U,
+    ) -> Result<()>
+    where
+        U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let authority_host = intercepted
             .sni_hostname
             .clone()
@@ -294,6 +319,27 @@ impl UpstreamHandler {
     }
 
     pub async fn socks5_connect_impl<U>(
+        &self,
+        intercepted: &InterceptedConnection,
+        upstream_stream: &mut U,
+    ) -> Result<()>
+    where
+        U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        match timeout(
+            self.handshake_timeout,
+            self.socks5_negotiate(intercepted, upstream_stream),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                Err(TotanError::UpstreamProxy("SOCKS5 handshake timed out".to_string()).into())
+            }
+        }
+    }
+
+    async fn socks5_negotiate<U>(
         &self,
         intercepted: &InterceptedConnection,
         upstream_stream: &mut U,
@@ -461,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_connect_tunnel() {
-        let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler = UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
         let mut conn = test_conn();
@@ -491,7 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_socks5_tunnel() {
-        let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler = UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
 
         let mut conn = test_conn();
@@ -525,11 +571,52 @@ mod tests {
         assert!(res.is_ok(), "SOCKS5 negotiation should succeed");
     }
 
+    /// A proxy that accepts the TCP connection but never sends a CONNECT
+    /// response must surface as an error within the handshake deadline, not
+    /// pin the task forever.
+    #[tokio::test]
+    async fn http_connect_times_out_on_stalled_proxy() {
+        let handler = UpstreamHandler::new(1000, 50, ErrorMitigationConfig::default(), 0).unwrap();
+        // Hold the mock end open but never write to it.
+        let (mut upstream, _upstream_mock) = tokio::io::duplex(1024);
+
+        let mut conn = test_conn();
+        conn.original_dest = "93.184.216.34:443".parse().unwrap();
+        conn.sni_hostname = Some("example.com".to_string());
+
+        let res = tokio::time::timeout(
+            Duration::from_millis(2000),
+            handler.http_connect_impl(&conn, &mut upstream),
+        )
+        .await
+        .expect("inner handshake timeout must fire before the outer guard");
+        assert!(res.is_err(), "a stalled proxy must surface as a handshake error");
+    }
+
+    /// SOCKS5 negotiation against a proxy that stalls mid-handshake must also
+    /// time out rather than block forever.
+    #[tokio::test]
+    async fn socks5_times_out_on_stalled_proxy() {
+        let handler = UpstreamHandler::new(1000, 50, ErrorMitigationConfig::default(), 0).unwrap();
+        let (mut upstream, _upstream_mock) = tokio::io::duplex(1024);
+
+        let mut conn = test_conn();
+        conn.sni_hostname = Some("example.com".to_string());
+
+        let res = tokio::time::timeout(
+            Duration::from_millis(2000),
+            handler.socks5_connect_impl(&conn, &mut upstream),
+        )
+        .await
+        .expect("inner handshake timeout must fire before the outer guard");
+        assert!(res.is_err(), "a stalled SOCKS5 proxy must surface as an error");
+    }
+
     /// Multi-header CONNECT response split across TCP segments must still
     /// be parsed correctly before handing off to the byte-pipe.
     #[tokio::test]
     async fn test_connect_response_with_extra_headers() {
-        let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler = UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
         let mut conn = test_conn();
@@ -562,7 +649,7 @@ mod tests {
     /// 407 (proxy auth required) surfaces as an error, not a silent tunnel.
     #[tokio::test]
     async fn test_connect_rejected_407() {
-        let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler = UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
         let mut conn = test_conn();
@@ -595,7 +682,7 @@ mod tests {
     /// 403 from a chained corporate proxy also surfaces as an error.
     #[tokio::test]
     async fn test_connect_rejected_403() {
-        let handler = UpstreamHandler::new(1000, ErrorMitigationConfig::default(), 0).unwrap();
+        let handler = UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
         let (mut upstream, mut upstream_mock) = tokio::io::duplex(4096);
 
         let mut conn = test_conn();

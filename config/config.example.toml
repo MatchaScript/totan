@@ -22,7 +22,7 @@ default_proxy = "http://proxy.example.com:8080"
 #     }
 #     return "PROXY proxy.corp.example:8080";
 #   }
-pac_location = "/etc/totan/config.pac"
+pac_file = "/etc/totan/config.pac"
 
 # Packet interception mode: "netfilter" or "ebpf".
 #
@@ -60,27 +60,31 @@ client_idle_secs = 600
 [netfilter]
 # Set to true to let totan manage nftables rules automatically.
 # When true, totan installs an OUTPUT nat hook that redirects ALL outbound TCP
-# traffic on redirect_ports to its listener, automatically excluding its own UID
-# to prevent redirect loops. Rules are removed on shutdown.
+# traffic on redirect_ports to its listener. totan's own upstream connections
+# are tagged with `fwmark` (SO_MARK) and returned early by the rule, preventing
+# redirect loops regardless of which user totan runs as. Rules are removed on
+# shutdown.
 #
 # When false (default), totan does not touch nftables — configure rules
 # externally (e.g. via system nftables config, Ansible, or manually).
 manage_rules = false
 
-# Additional UIDs whose traffic bypasses the proxy entirely.
-# totan's own UID is always excluded automatically; list here any other
-# processes that must not be intercepted (e.g. system daemons, monitoring).
-# exclude_uids = [0]   # exclude root
+# Socket mark (SO_MARK) totan sets on its own upstream connections and matches
+# with `meta mark <fwmark> return` to prevent redirect loops. Default: 0x7474.
+# Avoid Cilium's reserved range (0x0200–0x0E00).
+# fwmark = 0x7474
 
 # TCP destination ports to intercept. Default: [80, 443].
 redirect_ports = [80, 443]
 
 # ── eBPF-specific settings (only apply when interception_mode = "ebpf") ───────
 [ebpf]
-# Host-side network interface where container/pod traffic arrives.
+# Host-side network interfaces where container/pod traffic arrives. Accepts a
+# list of names or glob patterns (`*`, `?`); every matching interface is
+# attached at startup and new matches are picked up automatically.
 # For a Kubernetes pod this is the host-side end of the pod's veth pair
-# (e.g. "vethXXXXXX"); for a Docker bridge network it is the bridge uplink.
-ingress_interface = "veth-host"
+# (e.g. "lxc*"); for a Docker bridge network it is the bridge uplink.
+ingress_interfaces = ["veth-host"]
 
 # Port for the IP_TRANSPARENT TPROXY listener. Defaults to listen_port.
 # Override when the TPROXY socket needs a different port from the netfilter

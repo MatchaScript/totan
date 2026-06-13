@@ -27,6 +27,7 @@ impl ProxyResolver {
 pub struct ConnectionManager {
     resolver: ProxyResolver,
     upstream_handler: UpstreamHandler,
+    handshake_timeout: std::time::Duration,
 }
 
 impl ConnectionManager {
@@ -63,6 +64,7 @@ impl ConnectionManager {
 
         let upstream_handler = UpstreamHandler::new(
             config.timeouts.upstream_connect_ms,
+            config.timeouts.handshake_ms,
             config.mitigation.clone(),
             upstream_mark,
         )?;
@@ -70,6 +72,7 @@ impl ConnectionManager {
         Ok(Self {
             resolver,
             upstream_handler,
+            handshake_timeout: std::time::Duration::from_millis(config.timeouts.handshake_ms),
         })
     }
 
@@ -86,9 +89,14 @@ impl ConnectionManager {
             original_dest
         );
 
-        // For TLS connections, try to extract SNI hostname
+        // For TLS connections, try to extract SNI hostname. Bound by the
+        // handshake timeout so a client that connects to :443 and then stalls
+        // can't pin this task forever.
         let sni_hostname = if original_dest.port() == 443 {
-            extract_sni_hostname(&mut stream).await.ok()
+            tokio::time::timeout(self.handshake_timeout, extract_sni_hostname(&mut stream))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
         } else {
             None
         };
