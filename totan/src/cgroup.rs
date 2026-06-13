@@ -1,11 +1,11 @@
 //! Cgroup-based interception for host-originated egress.
 //!
-//! Loads `cgroup/connect4`, `sockops`, and `cgroup/sock_release` BPF
-//! programs from the same ELF as the tc ingress classifier (a separate
-//! `Ebpf` instance owns the maps independently) and attaches them to the
-//! cgroup directories listed in `HostHooksConfig::slices`.
+//! Loads the `cgroup/connect4` and `sockops` BPF programs from the same
+//! ELF as the tc ingress classifier (a separate `Ebpf` instance owns the
+//! maps independently) and attaches them to the cgroup directories listed
+//! in `HostHooksConfig::slices`.
 //!
-//! The three programs together rewrite outbound `connect(2)` to TCP/80
+//! The two programs together rewrite outbound `connect(2)` to TCP/80
 //! and TCP/443 to a local listener and record the original destination
 //! keyed by the ephemeral source port the kernel binds. Userspace
 //! recovers it by looking up `peer_addr.port()` (in network byte order)
@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use aya::{
     include_bytes_aligned,
     maps::{Array, HashMap as AyaHashMap, MapData},
-    programs::{CgroupAttachMode, CgroupSock, CgroupSockAddr, SockOps},
+    programs::{CgroupAttachMode, CgroupSockAddr, SockOps},
     Ebpf, EbpfLoader,
 };
 use aya_log::EbpfLogger;
@@ -70,7 +70,6 @@ pub struct HostLoader {
     _ebpf: Ebpf,
     _connect4_links: Vec<aya::programs::cgroup_sock_addr::CgroupSockAddrLink>,
     _sockops_links: Vec<aya::programs::sock_ops::SockOpsLink>,
-    _sock_release_links: Vec<aya::programs::cgroup_sock::CgroupSockLink>,
     sport_map: SportMap,
 }
 
@@ -151,7 +150,6 @@ impl HostLoader {
 
         let connect4_links = attach_connect4(&mut ebpf, slices)?;
         let sockops_links = attach_sockops(&mut ebpf, slices)?;
-        let sock_release_links = attach_sock_release(&mut ebpf, slices)?;
 
         // Take ownership of the sport map so the accept loop can consume from it.
         let sport_map_data = ebpf
@@ -169,7 +167,6 @@ impl HostLoader {
             _ebpf: ebpf,
             _connect4_links: connect4_links,
             _sockops_links: sockops_links,
-            _sock_release_links: sock_release_links,
             sport_map: Arc::new(Mutex::new(sport_map)),
         })
     }
@@ -192,8 +189,15 @@ fn attach_connect4(
     let mut links = Vec::with_capacity(slices.len());
     for slice in slices {
         let f = File::open(slice).with_context(|| format!("opening cgroup {}", slice.display()))?;
+        // `Single` here means `link_create.flags == 0`, NOT "only one program".
+        // check_prereqs() guarantees kernel >= 5.7, so aya takes the bpf_link
+        // path, where the kernel requires the flags field to be zero and applies
+        // multi semantics to links internally — so links still coexist with
+        // Cilium's cgroup programs. Passing AllowMultiple (BPF_F_ALLOW_MULTI)
+        // here is rejected with EINVAL by kernels that predate cgroup-link flag
+        // support. Cilium itself attaches its connect4 link with flags == 0.
         let id = prog
-            .attach(f, CgroupAttachMode::AllowMultiple)
+            .attach(f, CgroupAttachMode::Single)
             .with_context(|| format!("attaching connect4 to {}", slice.display()))?;
         links.push(prog.take_link(id)?);
         info!(slice = %slice.display(), "cgroup/connect4 attached");
@@ -214,31 +218,10 @@ fn attach_sockops(
     for slice in slices {
         let f = File::open(slice).with_context(|| format!("opening cgroup {}", slice.display()))?;
         let id = prog
-            .attach(f, CgroupAttachMode::AllowMultiple)
+            .attach(f, CgroupAttachMode::Single) // flags == 0; see attach_connect4
             .with_context(|| format!("attaching sockops to {}", slice.display()))?;
         links.push(prog.take_link(id)?);
         info!(slice = %slice.display(), "sockops attached");
-    }
-    Ok(links)
-}
-
-fn attach_sock_release(
-    ebpf: &mut Ebpf,
-    slices: &[PathBuf],
-) -> Result<Vec<aya::programs::cgroup_sock::CgroupSockLink>> {
-    let prog: &mut CgroupSock = ebpf
-        .program_mut("totan_sock_release")
-        .ok_or_else(|| anyhow::anyhow!("totan_sock_release program missing in ELF"))?
-        .try_into()?;
-    prog.load()?;
-    let mut links = Vec::with_capacity(slices.len());
-    for slice in slices {
-        let f = File::open(slice).with_context(|| format!("opening cgroup {}", slice.display()))?;
-        let id = prog
-            .attach(f, CgroupAttachMode::AllowMultiple)
-            .with_context(|| format!("attaching sock_release to {}", slice.display()))?;
-        links.push(prog.take_link(id)?);
-        info!(slice = %slice.display(), "cgroup/sock_release attached");
     }
     Ok(links)
 }
