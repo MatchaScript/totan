@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 use crate::pac::PacEvaluator;
 use crate::proxy::{proxies_from_url_str, Proxies};
 use crate::upstream::UpstreamHandler;
-use crate::utils::extract_sni_hostname;
+use crate::utils::{extract_http_host, extract_sni_hostname};
 
 enum ProxyResolver {
     Pac(Arc<PacEvaluator>),
@@ -27,6 +27,7 @@ impl ProxyResolver {
 pub struct ConnectionManager {
     resolver: ProxyResolver,
     upstream_handler: UpstreamHandler,
+    handshake_timeout: std::time::Duration,
 }
 
 impl ConnectionManager {
@@ -54,7 +55,9 @@ impl ConnectionManager {
         // In eBPF mode the interception is on ingress (tc hook), so upstream
         // connections are never redirected — and using the eBPF fwmark here
         // would accidentally match the policy-routing rule and route packets
-        // to loopback.
+        // to loopback. (The cgroup host-hook self-loop is prevented in
+        // userspace by refusing to run totan inside a hooked slice; see
+        // `crate::cgroup::load_and_attach`.)
         let upstream_mark = match config.interception_mode {
             InterceptionMode::Netfilter => config.netfilter.fwmark,
             #[cfg(feature = "ebpf")]
@@ -63,6 +66,7 @@ impl ConnectionManager {
 
         let upstream_handler = UpstreamHandler::new(
             config.timeouts.upstream_connect_ms,
+            config.timeouts.handshake_ms,
             config.mitigation.clone(),
             upstream_mark,
         )?;
@@ -70,6 +74,7 @@ impl ConnectionManager {
         Ok(Self {
             resolver,
             upstream_handler,
+            handshake_timeout: std::time::Duration::from_millis(config.timeouts.handshake_ms),
         })
     }
 
@@ -86,9 +91,25 @@ impl ConnectionManager {
             original_dest
         );
 
-        // For TLS connections, try to extract SNI hostname
+        // For TLS connections, try to extract SNI hostname. Bound by the
+        // handshake timeout so a client that connects to :443 and then stalls
+        // can't pin this task forever.
         let sni_hostname = if original_dest.port() == 443 {
-            extract_sni_hostname(&mut stream).await.ok()
+            tokio::time::timeout(self.handshake_timeout, extract_sni_hostname(&mut stream))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+        } else {
+            None
+        };
+
+        // For plain HTTP, recover the intended hostname from the Host header so
+        // PAC rules match on the domain rather than the bare destination IP.
+        let http_host = if original_dest.port() != 443 {
+            tokio::time::timeout(self.handshake_timeout, extract_http_host(&mut stream))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
         } else {
             None
         };
@@ -98,9 +119,11 @@ impl ConnectionManager {
             original_dest,
             sni_hostname: sni_hostname.clone(),
         };
-        // Build a human-readable target URL for logging and PAC resolution
+        // Build a human-readable target URL for logging and PAC resolution.
+        // Prefer the TLS SNI name, then the HTTP Host, then the bare IP.
         let hostname_for_url = sni_hostname
             .clone()
+            .or_else(|| http_host.clone())
             .unwrap_or_else(|| intercepted_conn.original_dest.ip().to_string());
         let scheme = if intercepted_conn.original_dest.port() == 443 {
             "https"

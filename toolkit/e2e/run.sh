@@ -32,6 +32,13 @@
 #              level, which is why we hook veth-host ingress rather than an
 #              uplink egress.
 #
+#              Additionally, in ebpf mode totan also loads cgroup/connect4 +
+#              sockops + cgroup/sock_release attached to a transient slice
+#              /sys/fs/cgroup/totan-e2e.slice. Host-originated curl scenarios
+#              are migrated into that slice by writing $$ to cgroup.procs;
+#              connect4 rewrites their dst to 127.0.0.1:3130 and userspace
+#              recovers original dst from the BPF sport map.
+#
 # Scenario layout (host→target mapping via curl --resolve, all in TEST-NET):
 #   plain.test        → 192.0.2.10  :80   plain HTTP → proxy-default → backend
 #   a-site.test       → 192.0.2.11  :443  HTTPS → proxy-a → TLS backend
@@ -114,6 +121,8 @@ cleanup() {
         ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
         ip netns del "$POD_NS" 2>/dev/null
         ip link del veth-host 2>/dev/null
+        # rmdir succeeds only when no procs remain — they all exit before us.
+        rmdir /sys/fs/cgroup/totan-e2e.slice 2>/dev/null
     fi
 
     if [[ "${_E2E_PASS:-0}" == "1" ]]; then
@@ -258,6 +267,14 @@ else  # ebpf
     ip netns exec "$POD_NS" ip route add default via 10.100.0.1
 
     CURL_PREFIX=(ip netns exec "$POD_NS")
+
+    # ─── cgroup slice for host-originated scenarios ──────────────────────────
+    # /sys/fs/cgroup/totan-e2e.slice must exist before totan starts so the
+    # cgroup loader can open it for attach. mkdir on cgroup v2 creates a new
+    # cgroup; no further controller subscription is needed for sock_addr /
+    # sockops / sock_release attach (those don't need any controller).
+    echo "[e2e] ebpf: creating /sys/fs/cgroup/totan-e2e.slice for host hooks"
+    mkdir -p /sys/fs/cgroup/totan-e2e.slice
 fi
 
 # ─── start totan ──────────────────────────────────────────────────────────────
@@ -450,6 +467,51 @@ if [[ "$oks" != "$conc_n" ]]; then
     printf '%s\n' "$conc_out" | grep -v '^OK$' | head -3 | sed 's/^/      /' >&2
 fi
 assert_eq "concurrent: ${conc_n}/${conc_n} requests succeeded" "$conc_n" "$oks"
+
+# ─── ebpf-only: host-originated scenarios via cgroup hooks ───────────────────
+# Skipped under netfilter mode (the netfilter rules redirect by uid, not by
+# cgroup, so the same scenarios would test a different code path).
+if [[ "$MODE" == "ebpf" ]]; then
+    # Run a curl in the host netns, but inside totan-e2e.slice. We migrate the
+    # process by writing $$ to cgroup.procs *before* exec'ing curl — connect4
+    # fires on the exec'd binary's syscalls because cgroup membership is
+    # inherited, so curl's connects are intercepted.
+    run_host_in_slice() {
+        bash -c '
+            echo $$ > /sys/fs/cgroup/totan-e2e.slice/cgroup.procs
+            exec "$@"
+        ' _ "${CURL_BASE[@]}" "$@" 2>&1 || true
+    }
+
+    echo
+    echo "── scenario H1: host-originated HTTP via cgroup connect4 → proxy ──────"
+    body=$(run_host_in_slice --resolve "plain.test:80:192.0.2.10" 'http://plain.test/')
+    assert_log_contains "$PROXY_DEFAULT_LOG" "GET http://plain.test/" "host-cgroup-http: proxy-default got it"
+    assert_eq           "host-cgroup-http: body round-trip" "backend:backend-http" "$body"
+
+    echo
+    echo "── scenario H2: host-originated HTTPS via cgroup connect4 → proxy-a ───"
+    body=$(run_host_in_slice --resolve 'a-site.test:443:192.0.2.11' 'https://a-site.test/')
+    assert_log_contains "$PROXY_A_LOG"     "CONNECT a-site.test:443" "host-cgroup-https: proxy-a saw CONNECT"
+    assert_log_contains "$BACKEND_TLS_LOG" "GET / host=a-site.test"  "host-cgroup-https: backend saw decrypted req"
+    assert_eq           "host-cgroup-https: body round-trip" "backend:backend-tls" "$body"
+
+    echo
+    echo "── scenario H3: untracked host process (outside slice) is NOT redirected"
+    # A curl that never enters totan-e2e.slice should fail because it would
+    # try to reach the unreachable TEST-NET IP directly. If it succeeds,
+    # something is intercepting it and we have a configuration leak.
+    direct_out=$("${CURL_BASE[@]}" --max-time 2 \
+                 --resolve 'plain.test:80:192.0.2.99' \
+                 'http://plain.test/' 2>&1 || true)
+    if [[ "$direct_out" == "backend:backend-http" ]]; then
+        echo "  ✗ untracked-host: expected timeout/refusal but got proxied response" >&2
+        fail=$((fail + 1))
+    else
+        echo "  ✓ untracked-host: out-of-slice traffic correctly NOT intercepted"
+        pass=$((pass + 1))
+    fi
+fi
 
 # ─── verdict ──────────────────────────────────────────────────────────────────
 echo

@@ -30,11 +30,27 @@ async fn main() -> anyhow::Result<()> {
     let connection_manager = Arc::new(ConnectionManager::new(config.clone()).await?);
     info!("Connection manager initialized");
 
-    // Setup graceful shutdown
+    // Setup graceful shutdown. SIGTERM is the default stop signal for systemd,
+    // Docker and Kubernetes; without it, RAII cleanup (nftables table, eBPF
+    // policy routing) would be skipped on the most common production shutdown
+    // path, leaving redirect rules installed system-wide.
     let shutdown_signal = async {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install CTRL+C signal handler");
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal as unix_signal, SignalKind};
+            let mut term =
+                unix_signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+            tokio::select! {
+                _ = signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            signal::ctrl_c()
+                .await
+                .expect("Failed to install CTRL+C signal handler");
+        }
     };
 
     // Start the proxy server
@@ -102,6 +118,12 @@ fn load_config(args: &CliArgs) -> anyhow::Result<TotanConfig> {
 
     if let Some(mode) = &args.mode {
         config.interception_mode = mode.clone().into();
+    }
+
+    // CLI flag turns on host hooks if config didn't already do so. The
+    // config can override the defaults; the flag is a quick on-switch.
+    if args.ebpf_host_hooks && config.ebpf.host_hooks.is_none() {
+        config.ebpf.host_hooks = Some(totan_common::config::HostHooksConfig::default());
     }
     // Logging overrides
     if let Some(lvl) = &args.log_level {

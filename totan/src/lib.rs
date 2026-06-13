@@ -1,3 +1,5 @@
+#[cfg(feature = "ebpf")]
+pub mod cgroup;
 pub mod cli;
 pub mod connection;
 #[cfg(feature = "ebpf")]

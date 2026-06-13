@@ -25,6 +25,17 @@
 //! For client-originated traffic, tc ingress of the host-side peer of the
 //! client's network pair device (veth / netkit) is the first tc hook the
 //! packet reaches on the host and is the natural attach point.
+//!
+//! ## Companion: cgroup hooks for host-originated traffic
+//!
+//! tc ingress only sees packets that traverse a tc hook on the host. Host
+//! processes (kubelet, containerd, dnf, ssh sessions) emit packets directly
+//! via the physical NIC's egress and never hit any pod-facing veth, so they
+//! would escape totan entirely. The companion module [`crate::cgroup`]
+//! attaches `cgroup/connect4` + `sockops` + `cgroup/sock_release` to systemd
+//! slices to capture them. The two subsystems are independent: tc ingress
+//! uses TPROXY + `sk_assign`; cgroup hooks rewrite `connect(2)` and recover
+//! original-dst from a sport-keyed BPF map.
 
 use std::net::Ipv4Addr;
 use std::process::Command;

@@ -7,6 +7,7 @@ fn default_listen_port() -> u16 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TotanConfig {
     /// The local port for totan to listen on
     #[serde(default = "default_listen_port")]
@@ -25,6 +26,12 @@ pub struct TotanConfig {
     /// PAC result cache maximum number of entries
     #[serde(default = "default_pac_cache_max_entries")]
     pub pac_cache_max_entries: usize,
+
+    /// Maximum number of connections handled simultaneously. Once reached, new
+    /// connections wait for a slot (backpressure) instead of growing tasks and
+    /// file descriptors without bound.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
 
     /// Packet interception mode: "netfilter" or "ebpf"
     #[serde(default)]
@@ -52,6 +59,7 @@ pub struct TotanConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EbpfConfig {
     /// Interface names or glob patterns (supports `*` and `?`) for the
     /// host-side peers of client network devices (veth / netkit). The tc
@@ -78,6 +86,56 @@ pub struct EbpfConfig {
     /// Default: 0x7474.
     #[serde(default = "default_fwmark")]
     pub fwmark: u32,
+
+    /// Optional host-process interception via cgroup BPF hooks
+    /// (`cgroup/connect4` + `sockops`). Disabled when absent.
+    /// See `HostHooksConfig` for details.
+    #[serde(default)]
+    pub host_hooks: Option<HostHooksConfig>,
+}
+
+/// Cgroup-based host egress interception. When present, totan loads
+/// `cgroup/connect4` + `sockops` BPF programs and attaches them to the
+/// listed cgroup paths. Connections from processes inside those cgroups
+/// (and their descendants) targeting TCP/80 or TCP/443 are redirected
+/// to `127.0.0.1:<redirect_port>`, where a plain TCP listener accepts
+/// them and recovers the original destination via a BPF map.
+///
+/// Pod traffic is **not** affected by this — pod processes live under
+/// `kubepods.slice`, deliberately omitted from the default slice list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostHooksConfig {
+    /// Local port for the cgroup-redirect listener. Must differ from the
+    /// TPROXY port used by tc ingress to keep accept loops separable.
+    #[serde(default = "default_host_redirect_port")]
+    pub redirect_port: u16,
+
+    /// cgroup v2 paths to attach to. Each path must exist and be a
+    /// directory under `/sys/fs/cgroup/`. Programs apply to the cgroup
+    /// itself and all descendants.
+    #[serde(default = "default_host_slices")]
+    pub slices: Vec<PathBuf>,
+}
+
+fn default_host_redirect_port() -> u16 {
+    3130
+}
+
+fn default_host_slices() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/sys/fs/cgroup/system.slice"),
+        PathBuf::from("/sys/fs/cgroup/user.slice"),
+    ]
+}
+
+impl Default for HostHooksConfig {
+    fn default() -> Self {
+        Self {
+            redirect_port: default_host_redirect_port(),
+            slices: default_host_slices(),
+        }
+    }
 }
 
 fn default_fwmark() -> u32 {
@@ -90,11 +148,56 @@ impl Default for EbpfConfig {
             ingress_interfaces: Vec::new(),
             tproxy_port: None,
             fwmark: default_fwmark(),
+            host_hooks: None,
         }
     }
 }
 
+#[cfg(test)]
+mod host_hooks_tests {
+    use super::*;
+
+    #[test]
+    fn ebpf_config_default_host_hooks_disabled() {
+        let cfg = EbpfConfig::default();
+        assert!(cfg.host_hooks.is_none(), "host_hooks must default to None");
+    }
+
+    #[test]
+    fn ebpf_config_parses_host_hooks_section() {
+        let toml_src = r#"
+            ingress_interfaces = ["lxc*"]
+            tproxy_port = 3129
+
+            [host_hooks]
+            redirect_port = 3130
+            slices = ["/sys/fs/cgroup/system.slice"]
+        "#;
+        let cfg: EbpfConfig = toml::from_str(toml_src).unwrap();
+        let hh = cfg.host_hooks.expect("host_hooks must parse");
+        assert_eq!(hh.redirect_port, 3130);
+        assert_eq!(
+            hh.slices,
+            vec![PathBuf::from("/sys/fs/cgroup/system.slice")]
+        );
+    }
+
+    #[test]
+    fn host_hooks_config_default_slices() {
+        let hh = HostHooksConfig::default();
+        assert_eq!(
+            hh.slices,
+            vec![
+                PathBuf::from("/sys/fs/cgroup/system.slice"),
+                PathBuf::from("/sys/fs/cgroup/user.slice"),
+            ]
+        );
+        assert_eq!(hh.redirect_port, 3130);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Log level: "trace", "debug", "info", "warn", or "error"
     #[serde(default = "default_log_level")]
@@ -123,10 +226,17 @@ fn default_log_format() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeoutConfig {
     /// Upstream connection timeout in milliseconds
     #[serde(default = "default_upstream_connect_ms")]
     pub upstream_connect_ms: u64,
+
+    /// Deadline in milliseconds for negotiation reads that would otherwise block
+    /// indefinitely: client SNI/ClientHello sniffing and the upstream proxy
+    /// CONNECT / SOCKS5 handshake. Bounds slow-loris-style connection pinning.
+    #[serde(default = "default_handshake_ms")]
+    pub handshake_ms: u64,
 
     /// Client connection idle timeout in seconds
     #[serde(default = "default_client_idle_secs")]
@@ -137,6 +247,7 @@ impl Default for TimeoutConfig {
     fn default() -> Self {
         Self {
             upstream_connect_ms: default_upstream_connect_ms(),
+            handshake_ms: default_handshake_ms(),
             client_idle_secs: default_client_idle_secs(),
         }
     }
@@ -144,6 +255,10 @@ impl Default for TimeoutConfig {
 
 fn default_upstream_connect_ms() -> u64 {
     3000
+}
+
+fn default_handshake_ms() -> u64 {
+    5000
 }
 
 fn default_client_idle_secs() -> u64 {
@@ -158,6 +273,7 @@ impl Default for TotanConfig {
             pac_file: None,
             pac_cache_ttl_secs: default_pac_cache_ttl_secs(),
             pac_cache_max_entries: default_pac_cache_max_entries(),
+            max_connections: default_max_connections(),
             interception_mode: Default::default(),
             logging: Default::default(),
             timeouts: Default::default(),
@@ -170,6 +286,7 @@ impl Default for TotanConfig {
 
 /// Netfilter-mode rule management configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetfilterConfig {
     /// When `true`, totan installs nftables OUTPUT rules that redirect all
     /// outbound TCP traffic on `redirect_ports` to its listener. Packets marked
@@ -209,6 +326,7 @@ fn default_redirect_ports() -> Vec<u16> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorMitigationConfig {
     /// Number of retry attempts on upstream connect failures (0 = no retry)
     #[serde(default = "default_retry_attempts")]
@@ -256,4 +374,52 @@ fn default_pac_cache_ttl_secs() -> u64 {
 }
 fn default_pac_cache_max_entries() -> usize {
     4096
+}
+fn default_max_connections() -> usize {
+    8192
+}
+
+#[cfg(test)]
+mod config_example_tests {
+    use super::*;
+
+    fn example_toml() -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../config/config.example.toml");
+        std::fs::read_to_string(path).expect("read config.example.toml")
+    }
+
+    /// The shipped example must deserialize against the real schema, and the
+    /// settings it documents must actually take effect — a regression guard for
+    /// key-name drift (`pac_location` vs `pac_file`, singular `ingress_interface`).
+    #[test]
+    fn example_config_deserializes_and_fields_apply() {
+        let cfg: TotanConfig =
+            toml::from_str(&example_toml()).expect("example must deserialize against schema");
+        assert!(
+            cfg.pac_file.is_some(),
+            "documented PAC file must populate `pac_file`, not be silently dropped"
+        );
+        assert!(
+            !cfg.ebpf.ingress_interfaces.is_empty(),
+            "documented ingress interface must populate `ingress_interfaces`"
+        );
+    }
+
+    /// Unknown / mistyped keys must be a hard error instead of being silently
+    /// ignored, so config drift surfaces at load time.
+    #[test]
+    fn unknown_config_key_is_rejected() {
+        let res: Result<TotanConfig, _> =
+            toml::from_str("listen_port = 3129\nbogus_unknown_key = 42\n");
+        assert!(res.is_err(), "unknown top-level key must be rejected");
+    }
+
+    #[test]
+    fn unknown_nested_key_is_rejected() {
+        let res: Result<TotanConfig, _> = toml::from_str("[netfilter]\nexclude_uids = [0]\n");
+        assert!(
+            res.is_err(),
+            "unknown key in a nested section must be rejected"
+        );
+    }
 }
