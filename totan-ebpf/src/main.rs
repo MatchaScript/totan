@@ -169,6 +169,13 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK as i32);
     }
 
+    // Non-initial IPv4 fragments carry no L4 header — the TcpHdr at the fixed
+    // offset would be payload bytes misread as ports/flags. Let the kernel
+    // reassemble them; only the first fragment (offset 0) is a real SYN.
+    if ipv4.frag_offset() != 0 {
+        return Ok(TC_ACT_OK as i32);
+    }
+
     let tcp: TcpHdr = ctx.load(EthHdr::LEN + Ipv4Hdr::LEN).map_err(|_| ())?;
     let dst_port = u16::from_be_bytes(tcp.dest);
     if dst_port != 80 && dst_port != 443 {
