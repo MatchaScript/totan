@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 use crate::pac::PacEvaluator;
 use crate::proxy::{proxies_from_url_str, Proxies};
 use crate::upstream::UpstreamHandler;
-use crate::utils::extract_sni_hostname;
+use crate::utils::{extract_http_host, extract_sni_hostname};
 
 enum ProxyResolver {
     Pac(Arc<PacEvaluator>),
@@ -101,14 +101,27 @@ impl ConnectionManager {
             None
         };
 
+        // For plain HTTP, recover the intended hostname from the Host header so
+        // PAC rules match on the domain rather than the bare destination IP.
+        let http_host = if original_dest.port() != 443 {
+            tokio::time::timeout(self.handshake_timeout, extract_http_host(&mut stream))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+        } else {
+            None
+        };
+
         let intercepted_conn = InterceptedConnection {
             client_addr,
             original_dest,
             sni_hostname: sni_hostname.clone(),
         };
-        // Build a human-readable target URL for logging and PAC resolution
+        // Build a human-readable target URL for logging and PAC resolution.
+        // Prefer the TLS SNI name, then the HTTP Host, then the bare IP.
         let hostname_for_url = sni_hostname
             .clone()
+            .or_else(|| http_host.clone())
             .unwrap_or_else(|| intercepted_conn.original_dest.ip().to_string());
         let scheme = if intercepted_conn.original_dest.port() == 443 {
             "https"

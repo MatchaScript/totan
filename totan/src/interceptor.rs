@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use totan_common::{config::TotanConfig, InterceptionMode};
 use tracing::{error, info};
 
@@ -38,10 +39,12 @@ impl PacketInterceptor {
             self.config.listen_port
         );
 
+        let limiter = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
         accept_loop(
             listener,
             connection_manager,
             OriginalDstSource::SoOriginalDst,
+            limiter,
         )
         .await
     }
@@ -108,21 +111,26 @@ impl PacketInterceptor {
             None => None,
         };
 
+        // One shared limiter caps total concurrent connections across both
+        // accept loops (tc TPROXY + cgroup host hooks).
+        let limiter = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
+
         // Run the accept loop(s) and the interface watcher concurrently.
         // When any branch exits (shutdown or error) the select cancels the
         // others, which drops the loaders and detaches all programs.
         match host {
             Some((_host_loader, host_listener, host_source)) => {
                 let cm2 = Arc::clone(&connection_manager);
+                let limiter2 = Arc::clone(&limiter);
                 tokio::select! {
-                    result = accept_loop(tproxy_listener, connection_manager, OriginalDstSource::SkAssign) => result,
-                    result = accept_loop(host_listener, cm2, host_source) => result,
+                    result = accept_loop(tproxy_listener, connection_manager, OriginalDstSource::SkAssign, limiter) => result,
+                    result = accept_loop(host_listener, cm2, host_source, limiter2) => result,
                     _ = watch_new_interfaces(&patterns, &mut tc_loader, initial_ifaces) => Ok(()),
                 }
             }
             None => {
                 tokio::select! {
-                    result = accept_loop(tproxy_listener, connection_manager, OriginalDstSource::SkAssign) => result,
+                    result = accept_loop(tproxy_listener, connection_manager, OriginalDstSource::SkAssign, limiter) => result,
                     _ = watch_new_interfaces(&patterns, &mut tc_loader, initial_ifaces) => Ok(()),
                 }
             }
@@ -151,14 +159,24 @@ async fn accept_loop(
     listener: TcpListener,
     connection_manager: Arc<ConnectionManager>,
     source: OriginalDstSource,
+    limiter: Arc<Semaphore>,
 ) -> Result<()> {
     loop {
+        // Acquire a slot *before* accepting so that at capacity we apply
+        // backpressure (the kernel holds pending SYNs in the listen backlog)
+        // instead of spawning per-connection tasks without bound until EMFILE.
+        let permit = Arc::clone(&limiter)
+            .acquire_owned()
+            .await
+            .expect("connection semaphore is never closed");
         match listener.accept().await {
             Ok((stream, client_addr)) => {
                 let connection_manager = Arc::clone(&connection_manager);
                 let source = source.clone();
 
                 tokio::spawn(async move {
+                    // Held for the connection's lifetime; released on completion.
+                    let _permit = permit;
                     let original_dest = match resolve_original_dest(&stream, &source).await {
                         Ok(addr) => addr,
                         Err(e) => {
@@ -179,6 +197,7 @@ async fn accept_loop(
                 });
             }
             Err(e) => {
+                drop(permit);
                 error!("Failed to accept connection: {}", e);
                 // Back off briefly to avoid spinning at 100% CPU on persistent
                 // errors such as EMFILE (too many open files).

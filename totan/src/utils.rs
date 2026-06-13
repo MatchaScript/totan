@@ -133,6 +133,52 @@ fn parse_sni_extension(data: &[u8]) -> Result<String> {
     Err(anyhow::anyhow!("No hostname in SNI extension"))
 }
 
+/// Extract the `Host` header hostname from a plain-HTTP request on `stream`
+/// (peeked, not consumed) so PAC resolution can key off the domain instead of
+/// the bare destination IP. Returns the hostname without any `:port` suffix.
+pub async fn extract_http_host(stream: &mut TcpStream) -> Result<String> {
+    let mut buf = [0u8; 4096];
+    let mut n = stream.peek(&mut buf).await?;
+    for _ in 0..8 {
+        if let Some(host) = parse_http_host(&buf[..n]) {
+            return Ok(host);
+        }
+        if n >= buf.len() {
+            break;
+        }
+        let m = stream.peek(&mut buf).await?;
+        if m == n {
+            break; // no progress
+        }
+        n = m;
+    }
+    Err(anyhow::anyhow!("no Host header in request"))
+}
+
+/// Parse the `Host` header out of (possibly partial) HTTP request bytes,
+/// returning the hostname with any `:port` stripped.
+fn parse_http_host(data: &[u8]) -> Option<String> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = httparse::Request::new(&mut headers);
+    // Ignore completeness: headers parsed before the cutoff are still populated,
+    // and the request line + Host arrive in the first segment in practice.
+    let _ = req.parse(data);
+    req.headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("host"))
+        .and_then(|h| std::str::from_utf8(h.value).ok())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            // Strip an optional :port. Bracketed IPv6 literals keep their
+            // brackets' contents; plain host:port splits on the last colon.
+            match v.strip_prefix('[').and_then(|r| r.split_once(']')) {
+                Some((h6, _)) => h6.to_string(),
+                None => v.rsplit_once(':').map(|(h, _)| h).unwrap_or(v).to_string(),
+            }
+        })
+}
+
 /// A tolerant version of tokio::io::copy_bidirectional that treats some
 /// common socket errors as normal termination. This mitigates spurious
 /// errors that transparent proxies often see when peers close abruptly.
@@ -224,6 +270,24 @@ mod tests {
         // the read buffer. SNI sits near the front and must still be parsed.
         let hello = client_hello_with_sni("ex.com", 60000);
         assert_eq!(extract_sni_from_bytes(&hello).unwrap(), "ex.com");
+    }
+
+    #[test]
+    fn http_host_parsed_from_request() {
+        let req = b"GET /path HTTP/1.1\r\nHost: example.com\r\nUser-Agent: x\r\n\r\n";
+        assert_eq!(parse_http_host(req).as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn http_host_strips_port() {
+        let req = b"GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+        assert_eq!(parse_http_host(req).as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn http_host_absent_returns_none() {
+        let req = b"GET / HTTP/1.1\r\n\r\n";
+        assert_eq!(parse_http_host(req), None);
     }
 
     #[test]

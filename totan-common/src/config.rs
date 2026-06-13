@@ -27,6 +27,12 @@ pub struct TotanConfig {
     #[serde(default = "default_pac_cache_max_entries")]
     pub pac_cache_max_entries: usize,
 
+    /// Maximum number of connections handled simultaneously. Once reached, new
+    /// connections wait for a slot (backpressure) instead of growing tasks and
+    /// file descriptors without bound.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+
     /// Packet interception mode: "netfilter" or "ebpf"
     #[serde(default)]
     pub interception_mode: InterceptionMode,
@@ -264,6 +270,7 @@ impl Default for TotanConfig {
             pac_file: None,
             pac_cache_ttl_secs: default_pac_cache_ttl_secs(),
             pac_cache_max_entries: default_pac_cache_max_entries(),
+            max_connections: default_max_connections(),
             interception_mode: Default::default(),
             logging: Default::default(),
             timeouts: Default::default(),
@@ -364,6 +371,9 @@ fn default_pac_cache_ttl_secs() -> u64 {
 }
 fn default_pac_cache_max_entries() -> usize {
     4096
+}
+fn default_max_connections() -> usize {
+    8192
 }
 
 #[cfg(test)]
