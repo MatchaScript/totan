@@ -36,6 +36,13 @@ use aya_log::EbpfLogger;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+/// SO_MARK totan stamps on its own outbound sockets in eBPF host-hook mode so
+/// `cgroup/connect4` leaves them untouched (preventing an infinite self-redirect
+/// loop). Must differ from the tc-ingress fwmark (0x7474) so it never matches
+/// the `ip rule fwmark 0x7474` policy-routing rule, and stay clear of Cilium's
+/// 0x0200–0x0E00 range.
+pub const HOST_HOOK_SELF_MARK: u32 = 0x7473;
+
 /// Layout-compatible mirror of the kernel-side `HostHookConfig` in
 /// `totan-ebpf/src/main.rs`. Both sides MUST be updated together.
 #[repr(C)]
@@ -44,6 +51,7 @@ pub struct HostHookConfig {
     pub redirect_ipv4_be: u32,
     pub redirect_port_be: u16,
     pub _pad: u16,
+    pub self_mark: u32,
 }
 // SAFETY: #[repr(C)], all fields are integers, explicit padding zeroes the
 // trailing bytes — the kernel verifier sees a fully initialised struct.
@@ -100,6 +108,7 @@ impl HostLoader {
         slices: &[PathBuf],
         redirect_addr: Ipv4Addr,
         redirect_port: u16,
+        self_mark: u32,
     ) -> Result<Self> {
         Self::check_prereqs()?;
 
@@ -131,6 +140,7 @@ impl HostLoader {
                     redirect_ipv4_be: u32::from(redirect_addr).to_be(),
                     redirect_port_be: redirect_port.to_be(),
                     _pad: 0,
+                    self_mark,
                 },
                 0,
             )?;
@@ -246,10 +256,11 @@ mod tests {
     }
 
     #[test]
-    fn host_hook_config_size_is_8_bytes() {
+    fn host_hook_config_size_is_12_bytes() {
         // The kernel verifier rejects struct mismatches between the BPF
-        // ELF's BTF and the userspace map definition. Pin the layout.
-        assert_eq!(core::mem::size_of::<HostHookConfig>(), 8);
+        // ELF's BTF and the userspace map definition. Pin the layout:
+        // u32 + u16 + u16 + u32 = 12 bytes (self_mark is the trailing u32).
+        assert_eq!(core::mem::size_of::<HostHookConfig>(), 12);
         assert_eq!(core::mem::align_of::<HostHookConfig>(), 4);
     }
 

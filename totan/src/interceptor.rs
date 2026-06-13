@@ -104,6 +104,7 @@ impl PacketInterceptor {
                     &hh.slices,
                     Ipv4Addr::LOCALHOST,
                     hh.redirect_port,
+                    crate::cgroup::HOST_HOOK_SELF_MARK,
                 )?;
                 let source = OriginalDstSource::CgroupSportMap(loader.sport_map());
                 Some((loader, host_listener, source))
