@@ -36,13 +36,6 @@ use aya_log::EbpfLogger;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-/// SO_MARK totan stamps on its own outbound sockets in eBPF host-hook mode so
-/// `cgroup/connect4` leaves them untouched (preventing an infinite self-redirect
-/// loop). Must differ from the tc-ingress fwmark (0x7474) so it never matches
-/// the `ip rule fwmark 0x7474` policy-routing rule, and stay clear of Cilium's
-/// 0x0200–0x0E00 range.
-pub const HOST_HOOK_SELF_MARK: u32 = 0x7473;
-
 /// Layout-compatible mirror of the kernel-side `HostHookConfig` in
 /// `totan-ebpf/src/main.rs`. Both sides MUST be updated together.
 #[repr(C)]
@@ -51,7 +44,6 @@ pub struct HostHookConfig {
     pub redirect_ipv4_be: u32,
     pub redirect_port_be: u16,
     pub _pad: u16,
-    pub self_mark: u32,
 }
 // SAFETY: #[repr(C)], all fields are integers, explicit padding zeroes the
 // trailing bytes — the kernel verifier sees a fully initialised struct.
@@ -108,7 +100,6 @@ impl HostLoader {
         slices: &[PathBuf],
         redirect_addr: Ipv4Addr,
         redirect_port: u16,
-        self_mark: u32,
     ) -> Result<Self> {
         Self::check_prereqs()?;
 
@@ -119,6 +110,19 @@ impl HostLoader {
             if !p.is_dir() {
                 anyhow::bail!("cgroup slice path is not a directory: {}", p.display());
             }
+        }
+
+        // Refuse to attach if totan itself lives inside a hooked slice: connect4
+        // would rewrite totan's own :80/:443 egress to the local listener, which
+        // re-accepts and reconnects out, looping forever (a self-inflicted DoS).
+        // Run totan in a dedicated slice outside the configured host-hook slices.
+        if let Some(offending) = totan_self_in_slice(slices) {
+            anyhow::bail!(
+                "totan is running inside hooked slice {} — connect4 would redirect \
+                 totan's own egress into its own listener and loop forever. Run totan \
+                 in a slice that is not listed in (or under) `ebpf.host_hooks.slices`.",
+                offending.display()
+            );
         }
 
         let elf = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/totan_bpf"));
@@ -140,7 +144,6 @@ impl HostLoader {
                     redirect_ipv4_be: u32::from(redirect_addr).to_be(),
                     redirect_port_be: redirect_port.to_be(),
                     _pad: 0,
-                    self_mark,
                 },
                 0,
             )?;
@@ -240,6 +243,46 @@ fn attach_sock_release(
     Ok(links)
 }
 
+/// totan's own cgroup-v2 path from `/proc/self/cgroup`, e.g.
+/// `/system.slice/totan.service`. `None` on non-cgroup-v2 / unreadable.
+fn totan_self_cgroup() -> Option<String> {
+    let content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    content
+        .lines()
+        .find_map(|l| l.strip_prefix("0::").map(|p| p.trim().to_string()))
+}
+
+/// Map a configured slice path (`/sys/fs/cgroup/system.slice`) to its
+/// cgroup-relative form (`/system.slice`).
+fn slice_to_cgroup_rel(slice: &Path) -> Option<String> {
+    let rel = slice.strip_prefix("/sys/fs/cgroup").ok()?;
+    Some(format!(
+        "/{}",
+        rel.to_string_lossy().trim_start_matches('/')
+    ))
+}
+
+/// True if `self_cgroup` is `slice_rel` itself or a descendant of it (compared
+/// on path segments, so `/system.sliceX` is not "within" `/system.slice`).
+fn cgroup_within(self_cgroup: &str, slice_rel: &str) -> bool {
+    let slice = slice_rel.trim_end_matches('/');
+    self_cgroup == slice || self_cgroup.starts_with(&format!("{slice}/"))
+}
+
+/// The first configured slice that totan's own process lives within (or at), if
+/// any — meaning host hooks would loop totan's own egress back into itself.
+fn totan_self_in_slice(slices: &[PathBuf]) -> Option<PathBuf> {
+    let self_cg = totan_self_cgroup()?;
+    slices
+        .iter()
+        .find(|slice| {
+            slice_to_cgroup_rel(slice)
+                .map(|rel| cgroup_within(&self_cg, &rel))
+                .unwrap_or(false)
+        })
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,12 +296,40 @@ mod tests {
     }
 
     #[test]
-    fn host_hook_config_size_is_12_bytes() {
+    fn host_hook_config_size_is_8_bytes() {
         // The kernel verifier rejects struct mismatches between the BPF
-        // ELF's BTF and the userspace map definition. Pin the layout:
-        // u32 + u16 + u16 + u32 = 12 bytes (self_mark is the trailing u32).
-        assert_eq!(core::mem::size_of::<HostHookConfig>(), 12);
+        // ELF's BTF and the userspace map definition. Pin the layout.
+        assert_eq!(core::mem::size_of::<HostHookConfig>(), 8);
         assert_eq!(core::mem::align_of::<HostHookConfig>(), 4);
+    }
+
+    #[test]
+    fn cgroup_within_detects_membership() {
+        assert!(cgroup_within(
+            "/system.slice/totan.service",
+            "/system.slice"
+        ));
+        assert!(cgroup_within("/system.slice", "/system.slice"));
+        assert!(cgroup_within(
+            "/system.slice/totan.service",
+            "/system.slice/"
+        ));
+        assert!(cgroup_within("/anything", "/")); // root contains everything
+        assert!(!cgroup_within("/user.slice/app.service", "/system.slice"));
+        // Prefix that is not a path segment must not count as "within".
+        assert!(!cgroup_within("/system.sliceX/foo", "/system.slice"));
+    }
+
+    #[test]
+    fn slice_path_maps_to_cgroup_relative() {
+        assert_eq!(
+            slice_to_cgroup_rel(Path::new("/sys/fs/cgroup/system.slice")).as_deref(),
+            Some("/system.slice")
+        );
+        assert_eq!(
+            slice_to_cgroup_rel(Path::new("/sys/fs/cgroup")).as_deref(),
+            Some("/")
+        );
     }
 
     #[test]

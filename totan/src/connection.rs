@@ -50,23 +50,18 @@ impl ConnectionManager {
             ProxyResolver::Fixed(Proxies::direct())
         };
 
-        // SO_MARK on upstream sockets prevents our own egress from being
-        // re-intercepted. In netfilter mode the OUTPUT hook matches the fwmark
-        // and returns early. In eBPF mode the tc-ingress path never sees our
-        // egress, but the cgroup `connect4` host hook does — so when host hooks
-        // are enabled we tag upstream sockets with the dedicated self-mark
-        // (distinct from the fwmark, so it can't trigger policy routing) and
-        // connect4 skips them. Without host hooks, no marking is needed.
+        // SO_MARK on upstream sockets is only needed in netfilter mode: the
+        // OUTPUT hook would otherwise re-intercept the proxy's own connections.
+        // In eBPF mode the interception is on ingress (tc hook), so upstream
+        // connections are never redirected — and using the eBPF fwmark here
+        // would accidentally match the policy-routing rule and route packets
+        // to loopback. (The cgroup host-hook self-loop is prevented in
+        // userspace by refusing to run totan inside a hooked slice; see
+        // `crate::cgroup::load_and_attach`.)
         let upstream_mark = match config.interception_mode {
             InterceptionMode::Netfilter => config.netfilter.fwmark,
             #[cfg(feature = "ebpf")]
-            InterceptionMode::Ebpf => {
-                if config.ebpf.host_hooks.is_some() {
-                    crate::cgroup::HOST_HOOK_SELF_MARK
-                } else {
-                    0
-                }
-            }
+            InterceptionMode::Ebpf => 0,
         };
 
         let upstream_handler = UpstreamHandler::new(

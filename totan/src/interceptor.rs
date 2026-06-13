@@ -100,12 +100,8 @@ impl PacketInterceptor {
                     "Cgroup host-hook listener on 127.0.0.1:{}",
                     hh.redirect_port
                 );
-                let loader = HostLoader::load_and_attach(
-                    &hh.slices,
-                    Ipv4Addr::LOCALHOST,
-                    hh.redirect_port,
-                    crate::cgroup::HOST_HOOK_SELF_MARK,
-                )?;
+                let loader =
+                    HostLoader::load_and_attach(&hh.slices, Ipv4Addr::LOCALHOST, hh.redirect_port)?;
                 let source = OriginalDstSource::CgroupSportMap(loader.sport_map());
                 Some((loader, host_listener, source))
             }

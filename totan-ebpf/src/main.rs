@@ -96,11 +96,6 @@ pub struct HostHookConfig {
     /// Redirect target TCP port in network byte order.
     pub redirect_port_be: u16,
     pub _pad: u16,
-    /// SO_MARK that totan stamps on its own outbound sockets. connect4 leaves
-    /// any connection carrying this mark untouched, so totan's own upstream /
-    /// direct egress to :80/:443 isn't redirected back into its own listener
-    /// (which would loop forever). Host byte order; 0 disables the check.
-    pub self_mark: u32,
 }
 
 #[map(name = "TOTAN_HOST_CFG")]
@@ -277,17 +272,6 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, ()> {
     }
 
     let cfg = TOTAN_HOST_CFG.get(0).ok_or(())?;
-
-    // Leave totan's own egress alone: it tags outbound sockets with `self_mark`,
-    // and rewriting those would redirect our upstream/direct connection back
-    // into our own listener and loop forever. The mark is set before connect(2)
-    // so it is visible here. (Cilium/dae use the same SO_MARK self-exclusion.)
-    if cfg.self_mark != 0 {
-        let sk = unsafe { (*ctx.sock_addr).__bindgen_anon_1.sk };
-        if !sk.is_null() && unsafe { (*sk).mark } == cfg.self_mark {
-            return Ok(1);
-        }
-    }
 
     let orig = OrigDst {
         addr_be: sa.user_ip4,
