@@ -226,8 +226,9 @@ async fn resolve_original_dest(
                     e
                 )
             })?;
-            // Eager remove so the LRU stays warm with live entries.
-            // sock_release is the safety-net, not the primary cleanup.
+            // Eager remove so the LRU stays warm with live entries. This is
+            // the only cleanup path: entries for connections that are never
+            // accepted age out of the LRU map instead.
             let _ = guard.remove(&sport_be);
             Ok(SocketAddr::V4(std::net::SocketAddrV4::new(
                 std::net::Ipv4Addr::from(u32::from_be(od.addr_be)),

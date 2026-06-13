@@ -39,10 +39,11 @@
 //!    once the kernel has bound an ephemeral source port. It re-keys the
 //!    saved original-dst from cookie → ephemeral source port (host byte
 //!    order) so userspace can recover it via `peer_addr.port()`.
-//! 3. `cgroup/sock_release` (`totan_sock_release`) evicts the sport entry
-//!    when the kernel destroys the socket. The accept loop also evicts
-//!    eagerly after reading; this hook is the safety net for connections
-//!    where accept never read the entry.
+//! 3. Cleanup: the accept loop evicts each `sport` entry right after it reads
+//!    it; entries for connections that are never accepted age out of the LRU
+//!    map. (A `cgroup/sock_release` hook would evict sooner, but that program
+//!    type cannot read `bpf_sock.src_port` — the verifier rejects the access
+//!    at any width — so the LRU bound is relied on instead.)
 //!
 //! Pattern lifted from Cilium socketLB (`reference/cilium/bpf/bpf_sock.c`),
 //! adapted for the transparent-proxy case where userspace **must** know the
@@ -55,9 +56,9 @@
 use aya_ebpf::{
     bindings::{bpf_sock_tuple, TC_ACT_OK},
     helpers::gen::{bpf_get_socket_cookie, bpf_sk_assign, bpf_sk_release, bpf_skc_lookup_tcp},
-    macros::{cgroup_sock, cgroup_sock_addr, classifier, map, sock_ops},
+    macros::{cgroup_sock_addr, classifier, map, sock_ops},
     maps::{Array, LruHashMap},
-    programs::{SockAddrContext, SockContext, SockOpsContext, TcContext},
+    programs::{SockAddrContext, SockOpsContext, TcContext},
 };
 use core::mem;
 use network_types::{
@@ -318,22 +319,6 @@ fn try_sockops(ctx: &SockOpsContext) -> Result<(), ()> {
     let _ = TOTAN_OD_BY_SPORT.insert(&sport_be, &orig, 0);
     let _ = TOTAN_OD_BY_COOKIE.remove(&cookie);
     Ok(())
-}
-
-/// `cgroup/sock_release` fires when the kernel destroys the socket struct.
-/// Pattern from Cilium `bpf/bpf_sock.c:1287-1323`. The accept loop's eager
-/// `remove()` is the primary cleanup path; this hook is the safety net for
-/// connections where accept never read the entry (totan crash mid-flow,
-/// connection refused, etc.).
-#[cgroup_sock(sock_release)]
-pub fn totan_sock_release(ctx: SockContext) -> i32 {
-    // SAFETY: ctx.sock is a valid kernel pointer for the hook lifetime.
-    let sk = unsafe { &*ctx.sock };
-    // src_port is host byte order (per include/uapi/linux/bpf.h);
-    // convert to BE to match the map's key encoding.
-    let sport_be: u16 = (sk.src_port as u16).to_be();
-    let _ = TOTAN_OD_BY_SPORT.remove(&sport_be);
-    1 // SK_PASS / proceed
 }
 
 // ---------------------------------------------------------------------------

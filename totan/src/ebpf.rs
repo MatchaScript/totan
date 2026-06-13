@@ -32,10 +32,10 @@
 //! processes (kubelet, containerd, dnf, ssh sessions) emit packets directly
 //! via the physical NIC's egress and never hit any pod-facing veth, so they
 //! would escape totan entirely. The companion module [`crate::cgroup`]
-//! attaches `cgroup/connect4` + `sockops` + `cgroup/sock_release` to systemd
-//! slices to capture them. The two subsystems are independent: tc ingress
-//! uses TPROXY + `sk_assign`; cgroup hooks rewrite `connect(2)` and recover
-//! original-dst from a sport-keyed BPF map.
+//! attaches `cgroup/connect4` + `sockops` to systemd slices to capture them.
+//! The two subsystems are independent: tc ingress uses TPROXY + `sk_assign`;
+//! cgroup hooks rewrite `connect(2)` and recover original-dst from a
+//! sport-keyed BPF map.
 
 use std::net::Ipv4Addr;
 use std::process::Command;

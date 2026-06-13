@@ -1,87 +1,74 @@
 # Known Issues / Follow-ups
 
-Tracked problems that are understood but not yet fixed.
+Tracked problems and their resolutions.
 
-## eBPF host-hook cgroup attach fails with EINVAL in CI
+## eBPF host-hook datapath never loaded in CI — RESOLVED
 
-**Status:** fix applied — awaiting CI e2e confirmation · surfaced by PR #9
-(`3e3b134`, 2026-06-13)
+**Status:** resolved · verified locally on Linux 6.19 and in CI on Linux 6.17 ·
+surfaced by PR #9 (`3e3b134`, 2026-06-13), fixed in PR #10
 
-### Fix
+The cgroup host-hook subsystem (`cgroup/connect4` + `sockops`, plus a since-
+removed `sock_release`) had **never run end-to-end** before PR #9 wired the H1/H2
+scenarios into CI: `origin/main` was 7 weeks behind (`adbff62c`) with no
+`cgroup.rs`, and the dev host masked both bugs below. Two independent defects had
+to be fixed before the host-hook datapath loaded.
 
-All three host-hook attach helpers now pass `CgroupAttachMode::Single`
-(`link_create.flags == 0`) instead of `AllowMultiple` (`BPF_F_ALLOW_MULTI`).
-On the bpf_link path (kernel ≥ 5.7, which `check_prereqs` already requires) the
-kernel requires the flags field to be zero and applies multi semantics to links
-internally, so link attachments still coexist with Cilium's cgroup programs.
-`AllowMultiple` was rejected with `EINVAL` by kernels predating cgroup-link flag
-support — including the GitHub Actions runner. **Precedent:** Cilium attaches its
-own `connect4` link with `flags == 0` (`link.AttachRawLink` in
-`reference/cilium/pkg/socketlb/cgroup.go`, no `Flags` set); aya's own
-`CgroupSockAddr` doc example uses `Single`.
+### Layer 1 — attach failed with `EINVAL`
 
-The failure only reproduces on the older CI kernel: the dev host (Linux 6.19)
-postdates cgroup-link flag support, so `AllowMultiple` attached fine there, which
-is why the host-hook feature passed local testing but failed CI.
-
----
-
-### Original report
-
-**Status when filed:** open · pre-existing · surfaced by PR #9 (`3e3b134`, 2026-06-13)
-
-### Symptom
-
-The `E2E (eBPF, PAC routing)` CI job fails at totan startup:
+totan exited at startup; **every** eBPF e2e scenario timed out
+(`mode: ebpf  passed: 3  failed: 28`), not just the host-cgroup ones:
 
 ```
-ERROR totan: Interceptor error: attaching connect4 to /sys/fs/cgroup/totan-e2e.slice
-Error: attaching connect4 to /sys/fs/cgroup/totan-e2e.slice
+attaching connect4 to /sys/fs/cgroup/totan-e2e.slice
   0: `bpf_link_create` failed
   1: Invalid argument (os error 22)
 ```
 
-Because `run_ebpf` bails when the host-hook attach fails, totan exits immediately
-and **every** eBPF e2e scenario times out (`mode: ebpf  passed: 3  failed: 28`),
-not just the host-cgroup ones (H1/H2).
+**Cause.** The attach helpers passed `CgroupAttachMode::AllowMultiple`, which aya
+translates to `BPF_F_ALLOW_MULTI` in the `bpf_link_create` flags field. On the
+bpf_link path (kernel ≥ 5.7, which `check_prereqs` already requires) the kernel
+requires that field to be **zero** for cgroup links and applies multi semantics
+internally, so a non-zero value is rejected with `EINVAL` on kernels predating
+cgroup-link flag support.
 
-### Root cause
+**Fix.** Use `CgroupAttachMode::Single` (`flags == 0`). Link attachments still
+coexist with Cilium's cgroup programs (the kernel treats links as multi
+internally). Precedent: Cilium attaches its own `connect4` link with `flags == 0`
+(`link.AttachRawLink`, no `Flags` set, in `reference/cilium/pkg/socketlb/cgroup.go`);
+aya's `CgroupSockAddr` doc example uses `Single`.
 
-`aya` 0.13.1's `CgroupSockAddr::attach` takes the kernel ≥ 5.7 link path and
-passes `CgroupAttachMode::AllowMultiple` → `BPF_F_ALLOW_MULTI` as the `flags`
-argument to `bpf_link_create`. The CI kernel rejects that flag on the cgroup
-link-create path with `EINVAL`. All three host-hook attach helpers in
-[`totan/src/cgroup.rs`](../totan/src/cgroup.rs) (`attach_connect4`,
-`attach_sockops`, `attach_sock_release`) use `AllowMultiple` deliberately, for
-Cilium coexistence.
+### Layer 2 — `sock_release` could not load (verifier)
 
-### Why it's pre-existing (not the robustness work)
+With Layer 1 fixed, `connect4`/`sockops` attached but the next program failed the
+verifier:
 
-- `origin/main` was 7 weeks behind (`adbff62c`) and had **no** `cgroup.rs` — the
-  host-hook feature commits (2026-05-06) only ever lived on the feature branch,
-  so the cgroup `connect4` H1/H2 scenarios had **never run through CI** before
-  PR #9 exercised them.
-- Reverting the PR's connect4 change reproduced the **identical** EINVAL (program
-  back to its base size), confirming the attach failure is in the base host-hook
-  code, not in the added self-loop guard.
+```
+; #[cgroup_sock(sock_release)] @ main.rs:328
+0: (61) r1 = *(u32 *)(r1 +44)
+invalid bpf_context access off=44 size=4
+```
 
-### Impact
+**Cause.** `totan_sock_release` read `bpf_sock.src_port` (offset 44) to evict the
+sport-keyed map entry. A `cgroup/sock_release` program **cannot read `src_port` at
+any width** — narrowing the load to 16 bits still failed
+(`invalid bpf_context access off=44 size=2`). This reproduced identically on the
+dev host (6.19) and CI (6.17), so the hook had never loaded on **any** kernel; the
+Layer 1 `EINVAL` had always aborted startup before it was reached. (Cilium reads
+`src_port` only from `post_bind` programs, via the narrow `ctx_src_port`; its own
+`sock_release` keys cleanup by socket cookie + `dst_ip4`/`dst_port`, never
+`src_port`.)
 
-- The host-hook datapath cannot be end-to-end verified in CI.
-- Consequently the cgroup `connect4` **self-loop guard** added in PR #9
-  (`totan_self_in_slice` in `cgroup.rs`) is only unit-tested, not e2e-verified —
-  it refuses to start totan inside a hooked slice; the guard logic itself is
-  covered by `cgroup_within_detects_membership` / `slice_path_maps_to_cgroup_rel`.
+**Fix.** Removed the `sock_release` hook entirely. It was a non-essential safety
+net: the accept loop evicts each sport entry right after reading it (primary
+cleanup), `sockops` overwrites on sport reuse (so a stale entry can never be
+mis-served), and `TOTAN_OD_BY_SPORT` is an LRU map that bounds growth on its own.
+Entries for connections that are never accepted now age out of the LRU instead of
+being freed at socket close — no correctness impact.
 
-### Things to try
+### Verification
 
-1. `CgroupAttachMode::Single` instead of `AllowMultiple` (changes attach
-   semantics — weigh against the Cilium-coexistence intent).
-2. Gate or fall back the link-vs-`prog_attach` attach path by kernel/runner.
-3. If GitHub Actions runners genuinely can't do cgroup BPF link attach to a
-   transient slice, skip H1/H2 in the GH `ebpf` e2e and cover them on a real
-   host instead.
-
-It likely works on a real host (the feature was developed and presumably tested
-locally), so **confirm whether the failure is environment-specific before
-changing the intentional `AllowMultiple` design.**
+`toolkit/e2e/run.sh ebpf` passes end-to-end (`passed: 31  failed: 0`), including
+the host-cgroup scenarios H1 (host HTTP), H2 (host HTTPS) and H3 (out-of-slice
+traffic not intercepted), on both Linux 6.19 (dev host) and the Linux 6.17 CI
+runner. The `connect4` self-loop guard added in PR #9 (`totan_self_in_slice`) is
+now exercised by a live datapath rather than unit tests alone.
