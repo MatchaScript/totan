@@ -4,7 +4,31 @@ Tracked problems that are understood but not yet fixed.
 
 ## eBPF host-hook cgroup attach fails with EINVAL in CI
 
-**Status:** open · pre-existing · surfaced by PR #9 (`3e3b134`, 2026-06-13)
+**Status:** fix applied — awaiting CI e2e confirmation · surfaced by PR #9
+(`3e3b134`, 2026-06-13)
+
+### Fix
+
+All three host-hook attach helpers now pass `CgroupAttachMode::Single`
+(`link_create.flags == 0`) instead of `AllowMultiple` (`BPF_F_ALLOW_MULTI`).
+On the bpf_link path (kernel ≥ 5.7, which `check_prereqs` already requires) the
+kernel requires the flags field to be zero and applies multi semantics to links
+internally, so link attachments still coexist with Cilium's cgroup programs.
+`AllowMultiple` was rejected with `EINVAL` by kernels predating cgroup-link flag
+support — including the GitHub Actions runner. **Precedent:** Cilium attaches its
+own `connect4` link with `flags == 0` (`link.AttachRawLink` in
+`reference/cilium/pkg/socketlb/cgroup.go`, no `Flags` set); aya's own
+`CgroupSockAddr` doc example uses `Single`.
+
+The failure only reproduces on the older CI kernel: the dev host (Linux 6.19)
+postdates cgroup-link flag support, so `AllowMultiple` attached fine there, which
+is why the host-hook feature passed local testing but failed CI.
+
+---
+
+### Original report
+
+**Status when filed:** open · pre-existing · surfaced by PR #9 (`3e3b134`, 2026-06-13)
 
 ### Symptom
 

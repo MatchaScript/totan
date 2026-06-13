@@ -192,8 +192,15 @@ fn attach_connect4(
     let mut links = Vec::with_capacity(slices.len());
     for slice in slices {
         let f = File::open(slice).with_context(|| format!("opening cgroup {}", slice.display()))?;
+        // `Single` here means `link_create.flags == 0`, NOT "only one program".
+        // check_prereqs() guarantees kernel >= 5.7, so aya takes the bpf_link
+        // path, where the kernel requires the flags field to be zero and applies
+        // multi semantics to links internally — so links still coexist with
+        // Cilium's cgroup programs. Passing AllowMultiple (BPF_F_ALLOW_MULTI)
+        // here is rejected with EINVAL by kernels that predate cgroup-link flag
+        // support. Cilium itself attaches its connect4 link with flags == 0.
         let id = prog
-            .attach(f, CgroupAttachMode::AllowMultiple)
+            .attach(f, CgroupAttachMode::Single)
             .with_context(|| format!("attaching connect4 to {}", slice.display()))?;
         links.push(prog.take_link(id)?);
         info!(slice = %slice.display(), "cgroup/connect4 attached");
@@ -214,7 +221,7 @@ fn attach_sockops(
     for slice in slices {
         let f = File::open(slice).with_context(|| format!("opening cgroup {}", slice.display()))?;
         let id = prog
-            .attach(f, CgroupAttachMode::AllowMultiple)
+            .attach(f, CgroupAttachMode::Single) // flags == 0; see attach_connect4
             .with_context(|| format!("attaching sockops to {}", slice.display()))?;
         links.push(prog.take_link(id)?);
         info!(slice = %slice.display(), "sockops attached");
@@ -235,7 +242,7 @@ fn attach_sock_release(
     for slice in slices {
         let f = File::open(slice).with_context(|| format!("opening cgroup {}", slice.display()))?;
         let id = prog
-            .attach(f, CgroupAttachMode::AllowMultiple)
+            .attach(f, CgroupAttachMode::Single) // flags == 0; see attach_connect4
             .with_context(|| format!("attaching sock_release to {}", slice.display()))?;
         links.push(prog.take_link(id)?);
         info!(slice = %slice.display(), "cgroup/sock_release attached");
