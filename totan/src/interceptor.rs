@@ -51,88 +51,137 @@ impl PacketInterceptor {
 
     #[cfg(feature = "ebpf")]
     async fn run_ebpf(self, connection_manager: Arc<ConnectionManager>) -> Result<()> {
-        use crate::cgroup::HostLoader;
-        use crate::ebpf::{resolve_interfaces, Loader};
-        use std::net::Ipv4Addr;
+        // Decide which subsystems to run from configuration alone. Interface
+        // *absence* is never fatal here — only the total absence of both tc
+        // ingress and host hooks is.
+        let plan = resolve_ebpf_plan(
+            !self.config.ebpf.ingress_interfaces.is_empty(),
+            self.config.ebpf.host_hooks.is_some(),
+        )?;
 
-        let patterns = self.config.ebpf.ingress_interfaces.clone();
-        if patterns.is_empty() {
-            anyhow::bail!(
-                "`ebpf.ingress_interfaces` must not be empty when interception_mode = ebpf"
-            );
-        }
-
-        let initial_ifaces = resolve_interfaces(&patterns);
-        if initial_ifaces.is_empty() {
-            anyhow::bail!(
-                "No interfaces matched {:?} — check `ebpf.ingress_interfaces`",
-                patterns
-            );
-        }
-
-        let tproxy_port = self
-            .config
-            .ebpf
-            .tproxy_port
-            .unwrap_or(self.config.listen_port);
-
-        // Bind the TPROXY listener *before* attaching the eBPF program so
-        // packets that arrive between attach and bind don't hit a "socket not
-        // found" path.
-        let tproxy_listener = bind_tproxy_listener(Ipv4Addr::LOCALHOST, tproxy_port)?;
-        info!(
-            "TPROXY listener (IP_TRANSPARENT) on 127.0.0.1:{}",
-            tproxy_port
-        );
-
-        let fwmark = self.config.ebpf.fwmark;
-        let iface_refs: Vec<&str> = initial_ifaces.iter().map(String::as_str).collect();
-        let mut tc_loader =
-            Loader::load_and_attach(&iface_refs, Ipv4Addr::LOCALHOST, tproxy_port, fwmark)?;
-
-        // Optional cgroup host hooks: load only when the config opts in.
-        // Same lifecycle pattern — bind listener first, then attach BPF.
-        let host = match &self.config.ebpf.host_hooks {
-            Some(hh) => {
-                let host_listener =
-                    TcpListener::bind(format!("127.0.0.1:{}", hh.redirect_port)).await?;
-                info!(
-                    "Cgroup host-hook listener on 127.0.0.1:{}",
-                    hh.redirect_port
-                );
-                let loader =
-                    HostLoader::load_and_attach(&hh.slices, Ipv4Addr::LOCALHOST, hh.redirect_port)?;
-                let source = OriginalDstSource::CgroupSportMap(loader.sport_map());
-                Some((loader, host_listener, source))
-            }
-            None => None,
-        };
-
-        // One shared limiter caps total concurrent connections across both
-        // accept loops (tc TPROXY + cgroup host hooks).
+        // One shared limiter caps total concurrent connections across whatever
+        // accept loops are active (tc TPROXY + cgroup host hooks).
         let limiter = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
 
-        // Run the accept loop(s) and the interface watcher concurrently.
-        // When any branch exits (shutdown or error) the select cancels the
-        // others, which drops the loaders and detaches all programs.
-        match host {
-            Some((_host_loader, host_listener, host_source)) => {
+        // The loaders returned by setup_* are kept alive in each arm's scope so
+        // RAII detaches the programs when the arm's select! resolves.
+        match (plan.tc, plan.host) {
+            (true, true) => {
+                let (tproxy_listener, mut tc_loader, patterns, initial) = setup_tc(&self.config)?;
+                let (_host_loader, host_listener, host_source) = setup_host(&self.config).await?;
                 let cm2 = Arc::clone(&connection_manager);
                 let limiter2 = Arc::clone(&limiter);
                 tokio::select! {
                     result = accept_loop(tproxy_listener, connection_manager, OriginalDstSource::SkAssign, limiter) => result,
                     result = accept_loop(host_listener, cm2, host_source, limiter2) => result,
-                    _ = watch_new_interfaces(&patterns, &mut tc_loader, initial_ifaces) => Ok(()),
+                    _ = watch_new_interfaces(&patterns, &mut tc_loader, initial) => Ok(()),
                 }
             }
-            None => {
+            (true, false) => {
+                let (tproxy_listener, mut tc_loader, patterns, initial) = setup_tc(&self.config)?;
                 tokio::select! {
                     result = accept_loop(tproxy_listener, connection_manager, OriginalDstSource::SkAssign, limiter) => result,
-                    _ = watch_new_interfaces(&patterns, &mut tc_loader, initial_ifaces) => Ok(()),
+                    _ = watch_new_interfaces(&patterns, &mut tc_loader, initial) => Ok(()),
                 }
             }
+            (false, true) => {
+                let (_host_loader, host_listener, host_source) = setup_host(&self.config).await?;
+                accept_loop(host_listener, connection_manager, host_source, limiter).await
+            }
+            (false, false) => unreachable!("resolve_ebpf_plan rejects (false, false)"),
         }
     }
+}
+
+/// Which eBPF subsystems to run, decided from configuration alone (before any
+/// interface resolution). Interface *absence* is never fatal — only the total
+/// absence of both subsystems is.
+#[cfg(feature = "ebpf")]
+#[derive(Debug, PartialEq, Eq)]
+struct EbpfPlan {
+    tc: bool,
+    host: bool,
+}
+
+#[cfg(feature = "ebpf")]
+fn resolve_ebpf_plan(interfaces_configured: bool, host_configured: bool) -> Result<EbpfPlan> {
+    if !interfaces_configured && !host_configured {
+        anyhow::bail!(
+            "nothing to intercept: set `ebpf.ingress_interfaces` and/or `ebpf.host_hooks`"
+        );
+    }
+    Ok(EbpfPlan {
+        tc: interfaces_configured,
+        host: host_configured,
+    })
+}
+
+/// Set up the tc ingress subsystem: bind the TPROXY listener, attach the tc
+/// program to whatever interfaces currently match (possibly none — the watcher
+/// attaches the rest as they appear). The returned `Loader` must outlive the
+/// accept loop so RAII detaches the program on shutdown.
+#[cfg(feature = "ebpf")]
+fn setup_tc(
+    config: &TotanConfig,
+) -> Result<(TcpListener, crate::ebpf::Loader, Vec<String>, Vec<String>)> {
+    use crate::ebpf::{resolve_interfaces, Loader};
+    use std::net::Ipv4Addr;
+
+    let patterns = config.ebpf.ingress_interfaces.clone();
+    let initial = resolve_interfaces(&patterns);
+    if initial.is_empty() {
+        tracing::warn!(
+            patterns = ?patterns,
+            "no interfaces match yet; starting with none and watching for new ones"
+        );
+    }
+    let tproxy_port = config.ebpf.tproxy_port.unwrap_or(config.listen_port);
+
+    // Bind the TPROXY listener *before* attaching the eBPF program so packets
+    // that arrive between attach and bind don't hit a "socket not found" path.
+    let tproxy_listener = bind_tproxy_listener(Ipv4Addr::LOCALHOST, tproxy_port)?;
+    info!(
+        "TPROXY listener (IP_TRANSPARENT) on 127.0.0.1:{}",
+        tproxy_port
+    );
+
+    let iface_refs: Vec<&str> = initial.iter().map(String::as_str).collect();
+    let loader = Loader::load_and_attach(
+        &iface_refs,
+        Ipv4Addr::LOCALHOST,
+        tproxy_port,
+        config.ebpf.fwmark,
+    )?;
+    Ok((tproxy_listener, loader, patterns, initial))
+}
+
+/// Set up the cgroup host-hook subsystem: bind the redirect listener, then
+/// attach `connect4`/`sockops` to the configured slices.
+#[cfg(feature = "ebpf")]
+async fn setup_host(
+    config: &TotanConfig,
+) -> Result<(crate::cgroup::HostLoader, TcpListener, OriginalDstSource)> {
+    use crate::cgroup::HostLoader;
+    use std::net::Ipv4Addr;
+
+    let hh = config
+        .ebpf
+        .host_hooks
+        .as_ref()
+        .expect("host plan implies host_hooks is Some");
+    let host_listener = TcpListener::bind(format!("127.0.0.1:{}", hh.redirect_port)).await?;
+    info!(
+        "Cgroup host-hook listener on 127.0.0.1:{}",
+        hh.redirect_port
+    );
+    let loader = HostLoader::load_and_attach(
+        &hh.slices,
+        Ipv4Addr::LOCALHOST,
+        hh.redirect_port,
+        crate::ebpf::DEFAULT_SELF_MARK,
+    )?;
+    let source = OriginalDstSource::CgroupSportMap(loader.sport_map());
+    Ok((loader, host_listener, source))
 }
 
 /// How to derive `original_dest` from an accepted connection.
@@ -356,4 +405,47 @@ fn set_ip_freebind(sock: &socket2::Socket) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("IP_FREEBIND setsockopt failed: {}", e));
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "ebpf"))]
+mod plan_tests {
+    use super::{resolve_ebpf_plan, EbpfPlan};
+
+    #[test]
+    fn tc_and_host() {
+        assert_eq!(
+            resolve_ebpf_plan(true, true).unwrap(),
+            EbpfPlan {
+                tc: true,
+                host: true
+            }
+        );
+    }
+
+    #[test]
+    fn tc_only() {
+        assert_eq!(
+            resolve_ebpf_plan(true, false).unwrap(),
+            EbpfPlan {
+                tc: true,
+                host: false
+            }
+        );
+    }
+
+    #[test]
+    fn host_only() {
+        assert_eq!(
+            resolve_ebpf_plan(false, true).unwrap(),
+            EbpfPlan {
+                tc: false,
+                host: true
+            }
+        );
+    }
+
+    #[test]
+    fn neither_is_error() {
+        assert!(resolve_ebpf_plan(false, false).is_err());
+    }
 }

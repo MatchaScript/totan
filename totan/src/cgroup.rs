@@ -44,6 +44,7 @@ pub struct HostHookConfig {
     pub redirect_ipv4_be: u32,
     pub redirect_port_be: u16,
     pub _pad: u16,
+    pub self_mark: u32,
 }
 // SAFETY: #[repr(C)], all fields are integers, explicit padding zeroes the
 // trailing bytes — the kernel verifier sees a fully initialised struct.
@@ -99,6 +100,7 @@ impl HostLoader {
         slices: &[PathBuf],
         redirect_addr: Ipv4Addr,
         redirect_port: u16,
+        self_mark: u32,
     ) -> Result<Self> {
         Self::check_prereqs()?;
 
@@ -111,16 +113,15 @@ impl HostLoader {
             }
         }
 
-        // Refuse to attach if totan itself lives inside a hooked slice: connect4
-        // would rewrite totan's own :80/:443 egress to the local listener, which
-        // re-accepts and reconnects out, looping forever (a self-inflicted DoS).
-        // Run totan in a dedicated slice outside the configured host-hook slices.
+        // totan tags its own egress with self_mark and connect4 skips it, so
+        // running inside a hooked slice no longer loops. We still warn because
+        // it relies on self_mark being applied to every interceptable outbound
+        // socket; surfacing it helps diagnose any future leak.
         if let Some(offending) = totan_self_in_slice(slices) {
-            anyhow::bail!(
-                "totan is running inside hooked slice {} — connect4 would redirect \
-                 totan's own egress into its own listener and loop forever. Run totan \
-                 in a slice that is not listed in (or under) `ebpf.host_hooks.slices`.",
-                offending.display()
+            warn!(
+                slice = %offending.display(),
+                "totan is running inside a hooked slice; relying on self_mark \
+                 self-exclusion to avoid a connect4 self-loop"
             );
         }
 
@@ -143,6 +144,7 @@ impl HostLoader {
                     redirect_ipv4_be: u32::from(redirect_addr).to_be(),
                     redirect_port_be: redirect_port.to_be(),
                     _pad: 0,
+                    self_mark,
                 },
                 0,
             )?;
@@ -278,11 +280,31 @@ mod tests {
         let _ = HostLoader::check_prereqs();
     }
 
+    /// Verifier smoke test for `connect4`: confirms the kernel accepts reading
+    /// `bpf_sock_addr->sk->mark` (the self-exclusion check). Loading runs the
+    /// verifier without attaching to any cgroup. Requires root (BPF_PROG_LOAD).
+    /// Ignored by default; run with:
+    ///   sudo -E $(which cargo) test -p totan --features ebpf load_connect4_verifies -- --ignored --nocapture
     #[test]
-    fn host_hook_config_size_is_8_bytes() {
+    #[ignore]
+    fn load_connect4_verifies() {
+        let elf = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/totan_bpf"));
+        let mut ebpf = EbpfLoader::new().load(elf).expect("load ELF + maps");
+        let prog: &mut CgroupSockAddr = ebpf
+            .program_mut("totan_connect4")
+            .expect("totan_connect4 present")
+            .try_into()
+            .expect("program is CgroupSockAddr");
+        prog.load()
+            .expect("connect4 must pass the verifier (sk->mark read)");
+    }
+
+    #[test]
+    fn host_hook_config_size_is_12_bytes() {
         // The kernel verifier rejects struct mismatches between the BPF
         // ELF's BTF and the userspace map definition. Pin the layout.
-        assert_eq!(core::mem::size_of::<HostHookConfig>(), 8);
+        // self_mark(u32) brings the struct to 12 bytes.
+        assert_eq!(core::mem::size_of::<HostHookConfig>(), 12);
         assert_eq!(core::mem::align_of::<HostHookConfig>(), 4);
     }
 

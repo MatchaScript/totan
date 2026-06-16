@@ -36,10 +36,14 @@ pac_file = "/etc/totan/config.pac"
 #   interface — typically the host-side veth peer of a container/pod. Intercepts
 #   traffic arriving FROM containers at that interface.
 #
-#   ⚠ ebpf mode cannot intercept host-originated traffic. The kernel restricts
-#     bpf_sk_assign to tc ingress; traffic from host processes exits through
-#     tc egress and is invisible to this hook. If you need to proxy programs
-#     running on the host itself, use netfilter instead.
+#   eBPF mode has two complementary interception paths:
+#     - tc ingress (ingress_interfaces) — container/pod traffic arriving at a
+#       host-side veth/netkit peer.
+#     - cgroup host hooks ([ebpf.host_hooks]) — host-originated egress (systemd
+#       services, login sessions) that never traverses a pod veth. totan tags
+#       its own sockets with a self-mark that connect4 skips, so it can safely
+#       run inside a hooked slice (e.g. a systemd unit in system.slice) without
+#       looping its own upstream traffic.
 #
 #   Requires: Linux kernel ≥ 6.6 (tcx multi-prog support), CAP_NET_ADMIN + CAP_BPF.
 interception_mode = "netfilter"
@@ -96,3 +100,24 @@ ingress_interfaces = ["veth-host"]
 # rather than forwarding them. Default: 0x7474 ("tt" for totan).
 # Avoid Cilium's reserved range (0x0200–0x0E00).
 # fwmark = 0x7474
+
+# ── Host-originated interception via cgroup BPF hooks (optional) ──────────────
+# Captures egress from host processes (systemd services, login sessions, dnf,
+# ssh, …) that never traverses a pod-facing veth and so is invisible to tc
+# ingress. Loads cgroup/connect4 + sockops on the listed cgroup v2 slices.
+# Disabled when this section is absent. Requires cgroup v2 and kernel ≥ 5.7.
+#
+# `ingress_interfaces` may be left empty ([]) to run host hooks ONLY (no tc
+# ingress); totan then starts even when no matching interface is present yet.
+#
+# [ebpf.host_hooks]
+# Local port for the cgroup-redirect listener. Must differ from tproxy_port.
+# Default: 3130.
+# redirect_port = 3130
+#
+# cgroup v2 paths to attach to (the cgroup itself and all descendants). Pod
+# traffic is left to tc ingress, so kubepods.slice is deliberately omitted.
+# totan tags its own egress with a self-mark that connect4 skips, so it is safe
+# to run totan as a systemd unit inside one of these slices.
+# Default: ["/sys/fs/cgroup/system.slice", "/sys/fs/cgroup/user.slice"].
+# slices = ["/sys/fs/cgroup/system.slice", "/sys/fs/cgroup/user.slice"]

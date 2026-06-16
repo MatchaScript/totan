@@ -97,6 +97,8 @@ pub struct HostHookConfig {
     /// Redirect target TCP port in network byte order.
     pub redirect_port_be: u16,
     pub _pad: u16,
+    /// Mark identifying totan's own sockets; connect4 skips matching sockets.
+    pub self_mark: u32,
 }
 
 #[map(name = "TOTAN_HOST_CFG")]
@@ -273,6 +275,18 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, ()> {
     }
 
     let cfg = TOTAN_HOST_CFG.get(0).ok_or(())?;
+
+    // Self-exclusion: totan tags its own outbound sockets with self_mark so we
+    // skip them here, breaking the connect→listener→reconnect loop. This lets
+    // totan run inside a hooked slice (e.g. system.slice) without looping.
+    // `sk` lives in an anonymous union (the `__bpf_md_ptr` ABI wrapper).
+    let sk = unsafe { sa.__bindgen_anon_1.sk };
+    if !sk.is_null() && cfg.self_mark != 0 {
+        let mark = unsafe { (*sk).mark };
+        if mark == cfg.self_mark {
+            return Ok(1);
+        }
+    }
 
     let orig = OrigDst {
         addr_be: sa.user_ip4,
