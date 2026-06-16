@@ -50,18 +50,18 @@ impl ConnectionManager {
             ProxyResolver::Fixed(Proxies::direct())
         };
 
-        // SO_MARK on upstream sockets is only needed in netfilter mode: the
-        // OUTPUT hook would otherwise re-intercept the proxy's own connections.
-        // In eBPF mode the interception is on ingress (tc hook), so upstream
-        // connections are never redirected — and using the eBPF fwmark here
-        // would accidentally match the policy-routing rule and route packets
-        // to loopback. (The cgroup host-hook self-loop is prevented in
-        // userspace by refusing to run totan inside a hooked slice; see
-        // `crate::cgroup::load_and_attach`.)
+        // SO_MARK on upstream sockets:
+        //  - netfilter mode: the OUTPUT hook would otherwise re-intercept the
+        //    proxy's own connections, so mark with the netfilter fwmark.
+        //  - eBPF mode: mark with DEFAULT_SELF_MARK (distinct from the routing
+        //    fwmark) so `cgroup/connect4` recognises totan's own egress and
+        //    skips it. This is what makes running totan inside a hooked slice
+        //    (e.g. system.slice) safe. The value must not match any `ip rule`,
+        //    or the egress would be policy-routed to loopback.
         let upstream_mark = match config.interception_mode {
             InterceptionMode::Netfilter => config.netfilter.fwmark,
             #[cfg(feature = "ebpf")]
-            InterceptionMode::Ebpf => 0,
+            InterceptionMode::Ebpf => crate::ebpf::DEFAULT_SELF_MARK,
         };
 
         let upstream_handler = UpstreamHandler::new(

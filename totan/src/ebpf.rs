@@ -53,6 +53,12 @@ use tracing::{info, warn};
 /// range (0x0200–0x0E00) and IPTables connmark ranges.
 pub const DEFAULT_FWMARK: u32 = 0x7474; // "tt" for totan
 
+/// Mark placed on totan's *own* outbound sockets so `cgroup/connect4` can
+/// recognise and skip them (self-exclusion). MUST differ from `DEFAULT_FWMARK`
+/// and MUST NOT be referenced by any `ip rule`, otherwise totan's own egress
+/// would be policy-routed to loopback. Kept adjacent to the fwmark value.
+pub const DEFAULT_SELF_MARK: u32 = 0x7475;
+
 /// Layout-compatible mirror of the kernel-side `TproxyConfig` in
 /// `totan-ebpf/src/main.rs`. Both sides **must** be updated in lock-step.
 ///
