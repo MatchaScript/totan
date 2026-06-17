@@ -97,3 +97,17 @@ fn nft(script: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_setup_manage_rules_false() {
+        let mut cfg = NetfilterConfig::default();
+        cfg.manage_rules = false;
+
+        let result = NetfilterManager::setup(8080, &cfg).unwrap();
+        assert!(result.is_none());
+    }
+}
