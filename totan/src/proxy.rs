@@ -363,4 +363,12 @@ mod tests {
             &ProxyOrDirect::Proxy(Proxy::Socks5("127.0.0.1:1080".parse().unwrap()))
         );
     }
+
+    #[test]
+    fn proxies_from_url_str_empty_host() {
+        assert_eq!(
+            proxies_from_url_str("socks5://"),
+            Err(ProxyParseError::EmptyHost("socks5://".to_string()))
+        );
+    }
 }
