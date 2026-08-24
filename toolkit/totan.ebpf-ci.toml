@@ -31,9 +31,9 @@ try_direct_on_proxy_failure = false
 # picks up pod-originated SYNs here and sk_assigns them to the TPROXY listener.
 ingress_interfaces = ["veth-host"]
 tproxy_port = 3129
-# Set on sk_assign'd packets; the loader installs
-# `ip rule fwmark <N> lookup 100` + `ip route local 0.0.0.0/0 dev lo table 100`
-# so marked packets get delivered locally regardless of their dst IP.
+# Set on sk_assign'd packets; the loader installs IPv4/IPv6 fwmark rules and
+# local routes in table 100 so marked packets get delivered locally regardless
+# of their destination.
 fwmark = 0x7474
 
 # Host-originated traffic (kubelet, dnf, anything not in a pod) is captured

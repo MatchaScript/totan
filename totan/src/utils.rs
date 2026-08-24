@@ -1,7 +1,61 @@
 use anyhow::Result;
 use std::io::ErrorKind;
+use std::net::{IpAddr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+
+/// Format a host and port as an RFC 3986 authority. IPv6 literals are
+/// bracketed; DNS names and IPv4 literals are left as-is.
+pub fn format_authority(host: &str, port: u16) -> String {
+    let host = host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{}]:{}", host, port),
+        _ => format!("{}:{}", host, port),
+    }
+}
+
+/// Format an authority while omitting its port when it equals the scheme's
+/// default. This is used for PAC target URLs and fallback HTTP Host values.
+pub fn format_authority_with_default(host: &str, port: u16, default_port: u16) -> String {
+    if port == default_port {
+        let host = host.trim();
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        match host.parse::<IpAddr>() {
+            Ok(IpAddr::V6(_)) => format!("[{}]", host),
+            _ => host.to_string(),
+        }
+    } else {
+        format_authority(host, port)
+    }
+}
+
+/// Format a socket address as an authority, preserving IPv6 brackets and its
+/// scope identifier. `SocketAddr`'s Display implementation already provides
+/// exactly the required host:port representation.
+pub fn socket_authority(addr: SocketAddr) -> String {
+    addr.to_string()
+}
+
+/// Format a socket address while omitting a default port.
+pub fn socket_authority_with_default(addr: SocketAddr, default_port: u16) -> String {
+    if addr.port() != default_port {
+        return socket_authority(addr);
+    }
+
+    match addr {
+        SocketAddr::V4(addr) => addr.ip().to_string(),
+        SocketAddr::V6(addr) if addr.scope_id() == 0 => format!("[{}]", addr.ip()),
+        SocketAddr::V6(addr) => format!("[{}%{}]", addr.ip(), addr.scope_id()),
+    }
+}
 
 /// Extract SNI hostname from a TLS ClientHello on `stream` (peeked, not consumed).
 pub async fn extract_sni_hostname(stream: &mut TcpStream) -> Result<String> {
@@ -206,6 +260,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authority_formats_hostnames_and_ip_literals() {
+        assert_eq!(format_authority("example.com", 443), "example.com:443");
+        assert_eq!(format_authority("192.0.2.1", 8080), "192.0.2.1:8080");
+        assert_eq!(format_authority("2001:db8::1", 443), "[2001:db8::1]:443");
+        assert_eq!(format_authority("[2001:db8::1]", 443), "[2001:db8::1]:443");
+    }
+
+    #[test]
+    fn authority_omits_only_the_default_port() {
+        assert_eq!(
+            format_authority_with_default("example.com", 80, 80),
+            "example.com"
+        );
+        assert_eq!(
+            format_authority_with_default("2001:db8::1", 80, 80),
+            "[2001:db8::1]"
+        );
+        assert_eq!(
+            format_authority_with_default("2001:db8::1", 8080, 80),
+            "[2001:db8::1]:8080"
+        );
+    }
+
+    #[test]
+    fn socket_authority_preserves_ipv6_scope() {
+        let addr = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            443,
+            0,
+            2,
+        ));
+        assert_eq!(socket_authority(addr), "[fe80::1%2]:443");
+        assert_eq!(socket_authority_with_default(addr, 443), "[fe80::1%2]");
+    }
 
     /// Build a minimal TLS ClientHello carrying a single SNI extension, with a
     /// caller-chosen value in the record-length header (so we can simulate a

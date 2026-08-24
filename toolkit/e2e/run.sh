@@ -21,9 +21,9 @@
 #
 # Modes differ in how they intercept the client's traffic:
 #
-#   netfilter: iptables OUTPUT REDIRECT scoped to a dedicated uid. The client
-#              (curl) runs as that uid on the host netns; totan listens on
-#              127.0.0.1:3129 and reads SO_ORIGINAL_DST on accept.
+#   netfilter: totan manages an inet OUTPUT REDIRECT ruleset. The client
+#              (curl) runs on the host netns; family-specific listeners read
+#              SO_ORIGINAL_DST/IP6T_SO_ORIGINAL_DST on accept.
 #
 #   ebpf:      pod netns with veth pair. totan attaches a tcx ingress program
 #              on the host-side veth, sets up fwmark policy routing, and binds
@@ -115,7 +115,7 @@ cleanup() {
     wait 2>/dev/null
 
     if [[ "$MODE" == "netfilter" ]]; then
-        nft delete table ip totan_e2e 2>/dev/null
+        ip -6 route del local 2001:db8::/32 dev lo table local 2>/dev/null
     else
         ip rule del fwmark 0x7474 lookup 100 2>/dev/null
         ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
@@ -160,7 +160,7 @@ TLS_KEY="$LOG_DIR/backend.key"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
     -keyout "$TLS_KEY" -out "$TLS_CERT" \
     -subj "/CN=totan-e2e-backend" \
-    -addext "subjectAltName=DNS:a-site.test,DNS:b-site.test,DNS:other.test,DNS:fail-over.test,DNS:socks-only.test,IP:127.0.0.1" \
+    -addext "subjectAltName=DNS:a-site.test,DNS:b-site.test,DNS:other.test,DNS:fail-over.test,DNS:socks-only.test,DNS:v6-secure.test,DNS:v6-host.test,IP:127.0.0.1" \
     2>/dev/null
 
 # netfilter mode runs curl as an unprivileged uid; mkstemp defaults to 0700
@@ -195,6 +195,10 @@ RESOLVE_MAP+=",other.test:443=127.0.0.1:$PORT_BACKEND_TLS"
 RESOLVE_MAP+=",other.test:8443=127.0.0.1:$PORT_BACKEND_TLS"
 RESOLVE_MAP+=",fail-over.test:443=127.0.0.1:$PORT_BACKEND_TLS"
 RESOLVE_MAP+=",socks-only.test:443=127.0.0.1:$PORT_BACKEND_TLS"
+RESOLVE_MAP+=",v6-plain.test:80=127.0.0.1:$PORT_BACKEND_HTTP"
+RESOLVE_MAP+=",v6-secure.test:443=127.0.0.1:$PORT_BACKEND_TLS"
+RESOLVE_MAP+=",v6-host-http.test:80=127.0.0.1:$PORT_BACKEND_HTTP"
+RESOLVE_MAP+=",v6-host.test:443=127.0.0.1:$PORT_BACKEND_TLS"
 RESOLVE_MAP+=",192.0.2.10:80=127.0.0.1:$PORT_BACKEND_HTTP"
 RESOLVE_MAP+=",192.0.2.14:80=127.0.0.1:$PORT_BACKEND_HTTP"
 
@@ -239,10 +243,11 @@ if [[ "$MODE" == "netfilter" ]]; then
             || useradd -u "$TEST_UID" -M "$TEST_USER"
     fi
 
-    echo "[e2e] netfilter: installing nftables redirect for uid $TEST_UID..."
-    nft add table ip totan_e2e
-    nft add chain ip totan_e2e output '{ type nat hook output priority -100; policy accept; }'
-    nft add rule ip totan_e2e output "meta skuid $TEST_UID tcp dport { 80, 443 } redirect to :3129"
+    # connect(2) requires a route before packets reach the OUTPUT hook. A local
+    # route makes the documentation prefix routable without creating a real
+    # endpoint; totan's managed inet rules then redirect both families.
+    echo "[e2e] netfilter: adding IPv6 documentation-prefix local route..."
+    ip -6 route add local 2001:db8::/32 dev lo table local
 
     CURL_PREFIX=(sudo -u "$TEST_USER" --preserve-env=PATH)
 
@@ -259,12 +264,15 @@ else  # ebpf
     ip link set veth-pod netns "$POD_NS"
     ip link set veth-host up
     ip addr add 10.100.0.1/24 dev veth-host
+    ip -6 addr add fd00:100::1/64 dev veth-host nodad
     sysctl -qw net.ipv4.conf.veth-host.rp_filter=0 2>/dev/null || true
 
     ip netns exec "$POD_NS" ip link set lo up
     ip netns exec "$POD_NS" ip link set veth-pod up
     ip netns exec "$POD_NS" ip addr add 10.100.0.2/24 dev veth-pod
     ip netns exec "$POD_NS" ip route add default via 10.100.0.1
+    ip netns exec "$POD_NS" ip -6 addr add fd00:100::2/64 dev veth-pod nodad
+    ip netns exec "$POD_NS" ip -6 route add default via fd00:100::1
 
     CURL_PREFIX=(ip netns exec "$POD_NS")
 
@@ -468,10 +476,41 @@ if [[ "$oks" != "$conc_n" ]]; then
 fi
 assert_eq "concurrent: ${conc_n}/${conc_n} requests succeeded" "$conc_n" "$oks"
 
+# ─── netfilter-only: IPv6 original-destination recovery ──────────────────────
+if [[ "$MODE" == "netfilter" ]]; then
+    echo
+    echo "── scenario N6-1: netfilter IPv6 HTTP → forward proxy ────────────────"
+    body=$(run_curl --resolve 'v6-plain.test:80:[2001:db8::10]' 'http://v6-plain.test/')
+    assert_log_contains "$PROXY_DEFAULT_LOG" "GET http://v6-plain.test/" "netfilter-ipv6-http: proxy got absolute URI"
+    assert_log_contains "$BACKEND_HTTP_LOG"  "GET / host=v6-plain.test"  "netfilter-ipv6-http: backend got Host"
+    assert_eq           "netfilter-ipv6-http: body round-trip" "backend:backend-http" "$body"
+
+    echo
+    echo "── scenario N6-2: netfilter IPv6 HTTPS → CONNECT ─────────────────────"
+    body=$(run_curl --resolve 'v6-secure.test:443:[2001:db8::11]' 'https://v6-secure.test/')
+    assert_log_contains "$PROXY_DEFAULT_LOG" "CONNECT v6-secure.test:443" "netfilter-ipv6-https: proxy saw CONNECT"
+    assert_log_contains "$BACKEND_TLS_LOG"   "GET / host=v6-secure.test"  "netfilter-ipv6-https: backend got request"
+    assert_eq           "netfilter-ipv6-https: body round-trip" "backend:backend-tls" "$body"
+fi
+
 # ─── ebpf-only: host-originated scenarios via cgroup hooks ───────────────────
 # Skipped under netfilter mode (the netfilter rules redirect by uid, not by
 # cgroup, so the same scenarios would test a different code path).
 if [[ "$MODE" == "ebpf" ]]; then
+    echo
+    echo "── scenario P6-1: pod IPv6 HTTP via tc ingress → proxy ───────────────"
+    body=$(run_curl --resolve 'v6-plain.test:80:[2001:db8::10]' 'http://v6-plain.test/')
+    assert_log_contains "$PROXY_DEFAULT_LOG" "GET http://v6-plain.test/" "pod-ipv6-http: proxy got absolute URI"
+    assert_log_contains "$BACKEND_HTTP_LOG"  "GET / host=v6-plain.test"  "pod-ipv6-http: backend got Host"
+    assert_eq           "pod-ipv6-http: body round-trip" "backend:backend-http" "$body"
+
+    echo
+    echo "── scenario P6-2: pod IPv6 HTTPS via tc ingress → CONNECT ───────────"
+    body=$(run_curl --resolve 'v6-secure.test:443:[2001:db8::11]' 'https://v6-secure.test/')
+    assert_log_contains "$PROXY_DEFAULT_LOG" "CONNECT v6-secure.test:443" "pod-ipv6-https: proxy saw CONNECT"
+    assert_log_contains "$BACKEND_TLS_LOG"   "GET / host=v6-secure.test"  "pod-ipv6-https: backend got request"
+    assert_eq           "pod-ipv6-https: body round-trip" "backend:backend-tls" "$body"
+
     # Run a curl in the host netns, but inside totan-e2e.slice. We migrate the
     # process by writing $$ to cgroup.procs *before* exec'ing curl — connect4
     # fires on the exec'd binary's syscalls because cgroup membership is
@@ -495,6 +534,20 @@ if [[ "$MODE" == "ebpf" ]]; then
     assert_log_contains "$PROXY_A_LOG"     "CONNECT a-site.test:443" "host-cgroup-https: proxy-a saw CONNECT"
     assert_log_contains "$BACKEND_TLS_LOG" "GET / host=a-site.test"  "host-cgroup-https: backend saw decrypted req"
     assert_eq           "host-cgroup-https: body round-trip" "backend:backend-tls" "$body"
+
+    echo
+    echo "── scenario H6-1: host IPv6 HTTP via cgroup connect6 ─────────────────"
+    body=$(run_host_in_slice --resolve 'v6-host-http.test:80:[2001:db8::12]' 'http://v6-host-http.test/')
+    assert_log_contains "$PROXY_DEFAULT_LOG" "GET http://v6-host-http.test/" "host-ipv6-http: proxy got absolute URI"
+    assert_log_contains "$BACKEND_HTTP_LOG"  "GET / host=v6-host-http.test"  "host-ipv6-http: backend got Host"
+    assert_eq           "host-ipv6-http: body round-trip" "backend:backend-http" "$body"
+
+    echo
+    echo "── scenario H6-2: host IPv6 HTTPS via cgroup connect6 ────────────────"
+    body=$(run_host_in_slice --resolve 'v6-host.test:443:[2001:db8::12]' 'https://v6-host.test/')
+    assert_log_contains "$PROXY_DEFAULT_LOG" "CONNECT v6-host.test:443" "host-ipv6-https: proxy saw CONNECT"
+    assert_log_contains "$BACKEND_TLS_LOG"   "GET / host=v6-host.test"  "host-ipv6-https: backend got request"
+    assert_eq           "host-ipv6-https: body round-trip" "backend:backend-tls" "$body"
 
     echo
     echo "── scenario H3: untracked host process (outside slice) is NOT redirected"

@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use pingora::apps::HttpServerApp;
+use pingora::apps::ServerApp;
 use pingora::http::RequestHeader;
 use pingora::proxy::{http_proxy, ProxyHttp, Session};
 use pingora::server::configuration::ServerConf;
 use pingora::upstreams::peer::HttpPeer;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::net::TcpStream;
 use url::Url;
 
@@ -46,15 +46,17 @@ pub async fn serve_http_connection(stream: TcpStream, ctx: Arc<HttpProxyContext>
         upstream_mark: ctx.upstream_mark,
     };
 
-    let conf = Arc::new(ServerConf::default());
-    let proxy = http_proxy(&conf, proxy_app);
+    static SERVER_CONF: OnceLock<Arc<ServerConf>> = OnceLock::new();
+    let conf = SERVER_CONF.get_or_init(|| Arc::new(ServerConf::default()));
+    let proxy = Arc::new(http_proxy(conf, proxy_app));
 
     let stream = pingora::protocols::l4::stream::Stream::from(stream);
-    let session = pingora::protocols::http::ServerSession::new_http1(Box::new(stream));
-
     let (_tx, shutdown) = tokio::sync::watch::channel(false);
 
-    Arc::new(proxy).process_new_http(session, &shutdown).await;
+    // ServerApp owns the HTTP/1 connection loop. Calling process_new_http()
+    // directly would process only one request and discard Pingora's reusable
+    // stream, breaking downstream keep-alive.
+    proxy.process_new(Box::new(stream), &shutdown).await;
 
     Ok(())
 }
@@ -124,13 +126,7 @@ impl ProxyHttp for TotanHttpProxy {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| {
-                let ip = self.intercepted.original_dest.ip().to_string();
-                let port = self.intercepted.original_dest.port();
-                if port == 80 {
-                    ip
-                } else {
-                    format!("{}:{}", ip, port)
-                }
+                crate::utils::socket_authority_with_default(self.intercepted.original_dest, 80)
             });
 
         let path = upstream_request
@@ -161,6 +157,31 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    async fn read_http_message(stream: &mut TcpStream) -> Vec<u8> {
+        let mut message = Vec::with_capacity(512);
+        let mut byte = [0u8; 1];
+        while !message.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            message.push(byte[0]);
+            assert!(message.len() <= 8192, "HTTP header exceeded test limit");
+        }
+
+        let text = String::from_utf8_lossy(&message);
+        let content_length = text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let header_len = message.len();
+        message.resize(header_len + content_length, 0);
+        stream.read_exact(&mut message[header_len..]).await.unwrap();
+        message
+    }
 
     #[tokio::test]
     async fn test_serve_http_connection() {
@@ -227,5 +248,62 @@ mod tests {
         let res_str = String::from_utf8_lossy(&response[..n]);
         assert!(res_str.contains("HTTP/1.1 200 OK"));
         assert!(res_str.contains("OK"));
+    }
+
+    #[tokio::test]
+    async fn downstream_keepalive_processes_multiple_requests() {
+        let upstream_proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_proxy_addr = upstream_proxy.local_addr().unwrap();
+
+        let proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream_proxy.accept().await.unwrap();
+            for path in ["/one", "/two"] {
+                let request = read_http_message(&mut stream).await;
+                let request = String::from_utf8_lossy(&request);
+                assert!(
+                    request.contains(&format!("GET http://example.com{} HTTP/1.1", path)),
+                    "unexpected upstream request: {request:?}"
+                );
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let intercepted = InterceptedConnection {
+            client_addr: "127.0.0.1:55555".parse().unwrap(),
+            original_dest: "192.0.2.10:80".parse().unwrap(),
+            sni_hostname: None,
+        };
+        let proxy_url = format!("http://127.0.0.1:{}", upstream_proxy_addr.port());
+        let ctx = HttpProxyContext::new(intercepted, &proxy_url, 0).unwrap();
+
+        let totan_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let totan_addr = totan_listener.local_addr().unwrap();
+        let totan_task = tokio::spawn(async move {
+            let (stream, _) = totan_listener.accept().await.unwrap();
+            serve_http_connection(stream, ctx).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(totan_addr).await.unwrap();
+        for path in ["/one", "/two"] {
+            client
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: example.com\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let response = read_http_message(&mut client).await;
+            assert!(response.ends_with(b"OK"));
+        }
+        client.shutdown().await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), proxy_task)
+            .await
+            .expect("upstream proxy did not receive both requests")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), totan_task)
+            .await
+            .expect("Pingora connection loop did not stop after client close")
+            .unwrap();
     }
 }

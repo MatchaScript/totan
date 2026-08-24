@@ -33,17 +33,36 @@ impl PacketInterceptor {
             &self.config.netfilter,
         )?;
 
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", self.config.listen_port)).await?;
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+        let listener_v4 = bind_listener(
+            SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::UNSPECIFIED,
+                self.config.listen_port,
+            )),
+            false,
+        )?;
+        let listener_v6 = bind_listener(
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::UNSPECIFIED,
+                self.config.listen_port,
+                0,
+                0,
+            )),
+            false,
+        )?;
         info!(
-            "Netfilter interceptor listening on port {}",
-            self.config.listen_port
+            "Netfilter interceptor listening on 0.0.0.0:{} and [::]:{}",
+            self.config.listen_port, self.config.listen_port
         );
 
         let limiter = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
-        accept_loop(
-            listener,
+        run_accept_loops(
+            vec![
+                (listener_v4, OriginalDstSource::SoOriginalDst),
+                (listener_v6, OriginalDstSource::SoOriginalDst),
+            ],
             connection_manager,
-            OriginalDstSource::SoOriginalDst,
             limiter,
         )
         .await
@@ -63,32 +82,31 @@ impl PacketInterceptor {
         // accept loops are active (tc TPROXY + cgroup host hooks).
         let limiter = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
 
-        // The loaders returned by setup_* are kept alive in each arm's scope so
-        // RAII detaches the programs when the arm's select! resolves.
-        match (plan.tc, plan.host) {
-            (true, true) => {
-                let (tproxy_listener, mut tc_loader, patterns, initial) = setup_tc(&self.config)?;
-                let (_host_loader, host_listener, host_source) = setup_host(&self.config).await?;
-                let cm2 = Arc::clone(&connection_manager);
-                let limiter2 = Arc::clone(&limiter);
-                tokio::select! {
-                    result = accept_loop(tproxy_listener, connection_manager, OriginalDstSource::SkAssign, limiter) => result,
-                    result = accept_loop(host_listener, cm2, host_source, limiter2) => result,
-                    _ = watch_new_interfaces(&patterns, &mut tc_loader, initial) => Ok(()),
-                }
+        let mut listeners = Vec::with_capacity(4);
+        let mut tc_state = if plan.tc {
+            let (tc_listeners, loader, patterns, initial) = setup_tc(&self.config)?;
+            listeners.extend(tc_listeners);
+            Some((loader, patterns, initial))
+        } else {
+            None
+        };
+        // Kept alive for RAII detach while the accept loops run.
+        let _host_loader = if plan.host {
+            let (loader, host_listeners) = setup_host(&self.config)?;
+            listeners.extend(host_listeners);
+            Some(loader)
+        } else {
+            None
+        };
+
+        let accept_loops = run_accept_loops(listeners, connection_manager, limiter);
+        if let Some((loader, patterns, initial)) = tc_state.as_mut() {
+            tokio::select! {
+                result = accept_loops => result,
+                _ = watch_new_interfaces(patterns, loader, std::mem::take(initial)) => Ok(()),
             }
-            (true, false) => {
-                let (tproxy_listener, mut tc_loader, patterns, initial) = setup_tc(&self.config)?;
-                tokio::select! {
-                    result = accept_loop(tproxy_listener, connection_manager, OriginalDstSource::SkAssign, limiter) => result,
-                    _ = watch_new_interfaces(&patterns, &mut tc_loader, initial) => Ok(()),
-                }
-            }
-            (false, true) => {
-                let (_host_loader, host_listener, host_source) = setup_host(&self.config).await?;
-                accept_loop(host_listener, connection_manager, host_source, limiter).await
-            }
-            (false, false) => unreachable!("resolve_ebpf_plan rejects (false, false)"),
+        } else {
+            accept_loops.await
         }
     }
 }
@@ -121,11 +139,17 @@ fn resolve_ebpf_plan(interfaces_configured: bool, host_configured: bool) -> Resu
 /// attaches the rest as they appear). The returned `Loader` must outlive the
 /// accept loop so RAII detaches the program on shutdown.
 #[cfg(feature = "ebpf")]
-fn setup_tc(
-    config: &TotanConfig,
-) -> Result<(TcpListener, crate::ebpf::Loader, Vec<String>, Vec<String>)> {
+type TcSetup = (
+    Vec<(TcpListener, OriginalDstSource)>,
+    crate::ebpf::Loader,
+    Vec<String>,
+    Vec<String>,
+);
+
+#[cfg(feature = "ebpf")]
+fn setup_tc(config: &TotanConfig) -> Result<TcSetup> {
     use crate::ebpf::{resolve_interfaces, Loader};
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
     let patterns = config.ebpf.ingress_interfaces.clone();
     let initial = resolve_interfaces(&patterns);
@@ -139,49 +163,84 @@ fn setup_tc(
 
     // Bind the TPROXY listener *before* attaching the eBPF program so packets
     // that arrive between attach and bind don't hit a "socket not found" path.
-    let tproxy_listener = bind_tproxy_listener(Ipv4Addr::LOCALHOST, tproxy_port)?;
+    let listener_v4 = bind_listener(
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, tproxy_port)),
+        true,
+    )?;
+    let listener_v6 = bind_listener(
+        SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, tproxy_port, 0, 0)),
+        true,
+    )?;
     info!(
-        "TPROXY listener (IP_TRANSPARENT) on 127.0.0.1:{}",
-        tproxy_port
+        "TPROXY listeners (IP_TRANSPARENT) on 127.0.0.1:{} and [::1]:{}",
+        tproxy_port, tproxy_port
     );
 
     let iface_refs: Vec<&str> = initial.iter().map(String::as_str).collect();
     let loader = Loader::load_and_attach(
         &iface_refs,
         Ipv4Addr::LOCALHOST,
+        Ipv6Addr::LOCALHOST,
         tproxy_port,
         config.ebpf.fwmark,
     )?;
-    Ok((tproxy_listener, loader, patterns, initial))
+    Ok((
+        vec![
+            (listener_v4, OriginalDstSource::SkAssign),
+            (listener_v6, OriginalDstSource::SkAssign),
+        ],
+        loader,
+        patterns,
+        initial,
+    ))
 }
 
 /// Set up the cgroup host-hook subsystem: bind the redirect listener, then
 /// attach `connect4`/`sockops` to the configured slices.
 #[cfg(feature = "ebpf")]
-async fn setup_host(
+fn setup_host(
     config: &TotanConfig,
-) -> Result<(crate::cgroup::HostLoader, TcpListener, OriginalDstSource)> {
+) -> Result<(
+    crate::cgroup::HostLoader,
+    Vec<(TcpListener, OriginalDstSource)>,
+)> {
     use crate::cgroup::HostLoader;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
     let hh = config
         .ebpf
         .host_hooks
         .as_ref()
         .expect("host plan implies host_hooks is Some");
-    let host_listener = TcpListener::bind(format!("127.0.0.1:{}", hh.redirect_port)).await?;
+    let listener_v4 = bind_listener(
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, hh.redirect_port)),
+        false,
+    )?;
+    let listener_v6 = bind_listener(
+        SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            hh.redirect_port,
+            0,
+            0,
+        )),
+        false,
+    )?;
     info!(
-        "Cgroup host-hook listener on 127.0.0.1:{}",
-        hh.redirect_port
+        "Cgroup host-hook listeners on 127.0.0.1:{} and [::1]:{}",
+        hh.redirect_port, hh.redirect_port
     );
     let loader = HostLoader::load_and_attach(
         &hh.slices,
         Ipv4Addr::LOCALHOST,
+        Ipv6Addr::LOCALHOST,
         hh.redirect_port,
         crate::ebpf::DEFAULT_SELF_MARK,
     )?;
     let source = OriginalDstSource::CgroupSportMap(loader.sport_map());
-    Ok((loader, host_listener, source))
+    Ok((
+        loader,
+        vec![(listener_v4, source.clone()), (listener_v6, source)],
+    ))
 }
 
 /// How to derive `original_dest` from an accepted connection.
@@ -194,11 +253,33 @@ enum OriginalDstSource {
     /// (== `TcpStream::local_addr`) is authoritative.
     #[cfg(feature = "ebpf")]
     SkAssign,
-    /// Cgroup `connect4` rewrote the dst to a local port; the original dst
+    /// Cgroup `connect4`/`connect6` rewrote the dst to a local port; the original dst
     /// was stashed by `sockops` keyed by the ephemeral source port. Look it
     /// up in the BPF map by `peer_addr.port().to_be()`.
     #[cfg(feature = "ebpf")]
     CgroupSportMap(crate::cgroup::SportMap),
+}
+
+async fn run_accept_loops(
+    listeners: Vec<(TcpListener, OriginalDstSource)>,
+    connection_manager: Arc<ConnectionManager>,
+    limiter: Arc<Semaphore>,
+) -> Result<()> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for (listener, source) in listeners {
+        tasks.spawn(accept_loop(
+            listener,
+            Arc::clone(&connection_manager),
+            source,
+            Arc::clone(&limiter),
+        ));
+    }
+
+    match tasks.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => Err(anyhow::anyhow!("accept loop task failed: {error}")),
+        None => Err(anyhow::anyhow!("no interception listeners configured")),
+    }
 }
 
 async fn accept_loop(
@@ -266,23 +347,20 @@ async fn resolve_original_dest(
         #[cfg(feature = "ebpf")]
         OriginalDstSource::CgroupSportMap(map) => {
             let peer = stream.peer_addr()?;
-            let sport_be = peer.port().to_be();
+            let key = crate::cgroup::SportKey::from_peer(peer);
             let mut guard = map.lock().await;
-            let od = guard.get(&sport_be, 0).map_err(|e| {
+            let od = guard.get(&key, 0).map_err(|e| {
                 anyhow::anyhow!(
-                    "no original-dst entry for sport {} (cgroup hook race or non-hooked source?): {}",
-                    peer.port(),
+                    "no original-dst entry for peer {} (cgroup hook race or non-hooked source?): {}",
+                    peer,
                     e
                 )
             })?;
             // Eager remove so the LRU stays warm with live entries. This is
             // the only cleanup path: entries for connections that are never
             // accepted age out of the LRU map instead.
-            let _ = guard.remove(&sport_be);
-            Ok(SocketAddr::V4(std::net::SocketAddrV4::new(
-                std::net::Ipv4Addr::from(u32::from_be(od.addr_be)),
-                u16::from_be(od.port_be),
-            )))
+            let _ = guard.remove(&key);
+            od.to_socket_addr()
         }
     }
 }
@@ -290,19 +368,10 @@ async fn resolve_original_dest(
 fn so_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
     #[cfg(target_os = "linux")]
     {
-        use nix::sys::socket::{getsockopt, sockopt::OriginalDst};
-        use std::net::SocketAddrV4;
-        use std::os::fd::BorrowedFd;
-        use std::os::unix::io::AsRawFd;
-
-        let fd = stream.as_raw_fd();
-        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        let orig_dst = getsockopt(&borrowed_fd, OriginalDst)?;
-        let addr = SocketAddrV4::new(
-            std::net::Ipv4Addr::from(orig_dst.sin_addr.s_addr.to_be()),
-            orig_dst.sin_port.to_be(),
-        );
-        Ok(SocketAddr::V4(addr))
+        match stream.peer_addr()? {
+            SocketAddr::V4(_) => so_original_dst_v4(stream),
+            SocketAddr::V6(_) => so_original_dst_v6(stream),
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -311,6 +380,59 @@ fn so_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
             .peer_addr()
             .map_err(|e| anyhow::anyhow!("Cannot get original destination: {}", e))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn so_original_dst_v4(stream: &TcpStream) -> Result<SocketAddr> {
+    use nix::sys::socket::{getsockopt, sockopt::OriginalDst};
+    use std::net::SocketAddrV4;
+    use std::os::fd::{AsRawFd, BorrowedFd};
+
+    let borrowed_fd = unsafe { BorrowedFd::borrow_raw(stream.as_raw_fd()) };
+    let orig_dst = getsockopt(&borrowed_fd, OriginalDst)?;
+    Ok(SocketAddr::V4(SocketAddrV4::new(
+        std::net::Ipv4Addr::from(orig_dst.sin_addr.s_addr.to_be()),
+        u16::from_be(orig_dst.sin_port),
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn so_original_dst_v6(stream: &TcpStream) -> Result<SocketAddr> {
+    use nix::libc;
+    use std::os::fd::AsRawFd;
+
+    // Linux exposes the IPv6 original destination through netfilter's
+    // IP6T_SO_ORIGINAL_DST option (same numeric option as IPv4, different
+    // protocol level). libc does not currently publish the named constant.
+    const IP6T_SO_ORIGINAL_DST: libc::c_int = 80;
+
+    let mut raw = unsafe { std::mem::zeroed::<libc::sockaddr_in6>() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            IP6T_SO_ORIGINAL_DST,
+            &mut raw as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if raw.sin6_family as libc::c_int != libc::AF_INET6 {
+        anyhow::bail!(
+            "IP6T_SO_ORIGINAL_DST returned unexpected address family {}",
+            raw.sin6_family
+        );
+    }
+
+    Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+        std::net::Ipv6Addr::from(raw.sin6_addr.s6_addr),
+        u16::from_be(raw.sin6_port),
+        u32::from_be(raw.sin6_flowinfo),
+        raw.sin6_scope_id,
+    )))
 }
 
 /// Poll `/sys/class/net` every 5 seconds for interfaces that match `patterns`
@@ -340,20 +462,30 @@ async fn watch_new_interfaces(
     }
 }
 
-/// Build a TPROXY-capable TCP listener bound to `addr:port`. Requires
-/// `CAP_NET_ADMIN` (for `IP_TRANSPARENT`).
-#[cfg(feature = "ebpf")]
-fn bind_tproxy_listener(addr: std::net::Ipv4Addr, port: u16) -> Result<TcpListener> {
+/// Build a family-specific listener. IPv6 sockets are forced to v6-only so
+/// IPv4 and IPv6 can bind the same port without platform-default ambiguity.
+fn bind_listener(addr: SocketAddr, transparent: bool) -> Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
-    use std::net::SocketAddrV4;
 
-    let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    let ipv6 = addr.is_ipv6();
+    let domain = if ipv6 { Domain::IPV6 } else { Domain::IPV4 };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     sock.set_nonblocking(true)?;
     sock.set_reuse_address(true)?;
-    set_ip_transparent(&sock)?;
-    set_ip_freebind(&sock)?;
+    if ipv6 {
+        sock.set_only_v6(true)?;
+    }
+    if transparent {
+        #[cfg(feature = "ebpf")]
+        {
+            set_ip_transparent(&sock, ipv6)?;
+            set_ip_freebind(&sock, ipv6)?;
+        }
+        #[cfg(not(feature = "ebpf"))]
+        anyhow::bail!("transparent listener requested without the ebpf feature");
+    }
 
-    sock.bind(&SocketAddrV4::new(addr, port).into())?;
+    sock.bind(&addr.into())?;
     sock.listen(1024)?;
 
     let std_listener: std::net::TcpListener = sock.into();
@@ -362,15 +494,23 @@ fn bind_tproxy_listener(addr: std::net::Ipv4Addr, port: u16) -> Result<TcpListen
 }
 
 #[cfg(feature = "ebpf")]
-fn set_ip_transparent(sock: &socket2::Socket) -> Result<()> {
+fn set_ip_transparent(sock: &socket2::Socket, ipv6: bool) -> Result<()> {
     use std::os::fd::AsRawFd;
     let enable: libc::c_int = 1;
     // SAFETY: passing a valid fd owned by `sock` and a stack-allocated int.
     let ret = unsafe {
         libc::setsockopt(
             sock.as_raw_fd(),
-            libc::IPPROTO_IP,
-            libc::IP_TRANSPARENT,
+            if ipv6 {
+                libc::IPPROTO_IPV6
+            } else {
+                libc::IPPROTO_IP
+            },
+            if ipv6 {
+                libc::IPV6_TRANSPARENT
+            } else {
+                libc::IP_TRANSPARENT
+            },
             &enable as *const _ as *const libc::c_void,
             std::mem::size_of_val(&enable) as libc::socklen_t,
         )
@@ -378,7 +518,12 @@ fn set_ip_transparent(sock: &socket2::Socket) -> Result<()> {
     if ret != 0 {
         return Err(std::io::Error::last_os_error()).map_err(|e| {
             anyhow::anyhow!(
-                "IP_TRANSPARENT setsockopt failed (need CAP_NET_ADMIN): {}",
+                "{} setsockopt failed (need CAP_NET_ADMIN): {}",
+                if ipv6 {
+                    "IPV6_TRANSPARENT"
+                } else {
+                    "IP_TRANSPARENT"
+                },
                 e
             )
         });
@@ -387,22 +532,35 @@ fn set_ip_transparent(sock: &socket2::Socket) -> Result<()> {
 }
 
 #[cfg(feature = "ebpf")]
-fn set_ip_freebind(sock: &socket2::Socket) -> Result<()> {
+fn set_ip_freebind(sock: &socket2::Socket, ipv6: bool) -> Result<()> {
     use std::os::fd::AsRawFd;
     let enable: libc::c_int = 1;
     // SAFETY: same rationale as `set_ip_transparent`.
     let ret = unsafe {
         libc::setsockopt(
             sock.as_raw_fd(),
-            libc::IPPROTO_IP,
-            libc::IP_FREEBIND,
+            if ipv6 {
+                libc::IPPROTO_IPV6
+            } else {
+                libc::IPPROTO_IP
+            },
+            if ipv6 {
+                libc::IPV6_FREEBIND
+            } else {
+                libc::IP_FREEBIND
+            },
             &enable as *const _ as *const libc::c_void,
             std::mem::size_of_val(&enable) as libc::socklen_t,
         )
     };
     if ret != 0 {
-        return Err(std::io::Error::last_os_error())
-            .map_err(|e| anyhow::anyhow!("IP_FREEBIND setsockopt failed: {}", e));
+        return Err(std::io::Error::last_os_error()).map_err(|e| {
+            anyhow::anyhow!(
+                "{} setsockopt failed: {}",
+                if ipv6 { "IPV6_FREEBIND" } else { "IP_FREEBIND" },
+                e
+            )
+        });
     }
     Ok(())
 }
@@ -447,5 +605,29 @@ mod plan_tests {
     #[test]
     fn neither_is_error() {
         assert!(resolve_ebpf_plan(false, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::bind_listener;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
+    #[tokio::test]
+    async fn ipv4_and_ipv6_listeners_can_share_a_port() {
+        let ipv4 = bind_listener(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            false,
+        )
+        .unwrap();
+        let port = ipv4.local_addr().unwrap().port();
+        let ipv6 = bind_listener(
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0)),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(ipv4.local_addr().unwrap().port(), port);
+        assert_eq!(ipv6.local_addr().unwrap().port(), port);
     }
 }

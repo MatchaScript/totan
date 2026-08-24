@@ -1,11 +1,12 @@
 //! Automatic nftables rule management for netfilter interception mode.
 //!
-//! [`NetfilterManager::setup`] installs a `table ip totan` with an OUTPUT
-//! nat hook that redirects outbound TCP traffic on the configured ports to
-//! totan's listener. Packets already marked with `cfg.fwmark` via `SO_MARK`
-//! (set on totan's own upstream sockets) are returned early, preventing
-//! redirect loops regardless of which user the process runs as. RFC-1918 and
-//! loopback destinations are also excluded.
+//! [`NetfilterManager::setup`] installs a `table inet totan` with an OUTPUT
+//! nat hook that redirects IPv4 and IPv6 TCP traffic on the configured ports
+//! to totan's family-matched listeners. Packets already marked with
+//! `cfg.fwmark` via `SO_MARK` (set on totan's own upstream sockets) are
+//! returned early, preventing redirect loops regardless of which user the
+//! process runs as. Private, link-local, and loopback destinations are also
+//! excluded.
 //!
 //! Rules are removed when [`NetfilterManager`] is dropped, so Ctrl-C or a
 //! normal process exit always leaves the system clean.
@@ -20,7 +21,9 @@ use totan_common::config::NetfilterConfig;
 
 const TABLE: &str = "totan";
 
-const PRIVATE_NETS: &str = "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16";
+const PRIVATE_NETS_V4: &str =
+    "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16";
+const PRIVATE_NETS_V6: &str = "::1/128, fc00::/7, fe80::/10";
 
 /// RAII guard that installs nftables rules on construction and removes them
 /// on drop.
@@ -43,19 +46,12 @@ impl NetfilterManager {
             .collect::<Vec<_>>()
             .join(", ");
 
-        // Remove any stale table left by a previous crash, then create fresh.
+        // Remove any stale table left by a previous crash. The legacy IPv4
+        // table name is also cleaned up when upgrading from an older version.
+        nft(&format!("delete table inet {TABLE}")).ok();
         nft(&format!("delete table ip {TABLE}")).ok();
 
-        nft(&format!(
-            "table ip {TABLE} {{\
-             \n\tchain output {{\
-             \n\t\ttype nat hook output priority -100; policy accept;\
-             \n\t\tmeta mark {fwmark:#010x} return\
-             \n\t\tip daddr {{ {PRIVATE_NETS} }} return\
-             \n\t\ttcp dport {{ {port_set} }} redirect to :{listen_port}\
-             \n\t}}\
-             \n}}"
-        ))?;
+        nft(&render_ruleset(fwmark, &port_set, listen_port))?;
 
         info!(
             fwmark,
@@ -69,11 +65,25 @@ impl NetfilterManager {
 
 impl Drop for NetfilterManager {
     fn drop(&mut self) {
-        match nft(&format!("delete table ip {TABLE}")) {
+        match nft(&format!("delete table inet {TABLE}")) {
             Ok(_) => info!("nftables table {TABLE} removed"),
             Err(e) => warn!("Failed to remove nftables table {TABLE}: {e}"),
         }
     }
+}
+
+fn render_ruleset(fwmark: u32, port_set: &str, listen_port: u16) -> String {
+    format!(
+        "table inet {TABLE} {{\
+         \n\tchain output {{\
+         \n\t\ttype nat hook output priority -100; policy accept;\
+         \n\t\tmeta mark {fwmark:#010x} return\
+         \n\t\tip daddr {{ {PRIVATE_NETS_V4} }} return\
+         \n\t\tip6 daddr {{ {PRIVATE_NETS_V6} }} return\
+         \n\t\ttcp dport {{ {port_set} }} redirect to :{listen_port}\
+         \n\t}}\
+         \n}}"
+    )
 }
 
 fn nft(script: &str) -> Result<()> {
@@ -96,4 +106,20 @@ fn nft(script: &str) -> Result<()> {
         return Err(anyhow::anyhow!("nft script failed:\n{script}\n{stderr}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_ruleset;
+
+    #[test]
+    fn ruleset_is_dual_stack_and_keeps_shared_mark_exclusion() {
+        let rules = render_ruleset(0x7474, "80, 443", 3129);
+
+        assert!(rules.contains("table inet totan"));
+        assert!(rules.contains("meta mark 0x00007474 return"));
+        assert!(rules.contains("ip daddr { 127.0.0.0/8"));
+        assert!(rules.contains("ip6 daddr { ::1/128, fc00::/7, fe80::/10 } return"));
+        assert!(rules.contains("tcp dport { 80, 443 } redirect to :3129"));
+    }
 }

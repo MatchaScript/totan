@@ -13,6 +13,8 @@
 //! ```text
 //! ip rule add fwmark <FWMARK> lookup 100 priority 100
 //! ip route add local 0.0.0.0/0 dev lo table 100
+//! ip -6 rule add fwmark <FWMARK> lookup 100 priority 100
+//! ip -6 route add local ::/0 dev lo table 100
 //! ```
 //!
 //! `Loader::setup_policy_routing` applies these rules automatically at startup
@@ -37,7 +39,7 @@
 //! cgroup hooks rewrite `connect(2)` and recover original-dst from a
 //! sport-keyed BPF map.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 
 use aya::{
@@ -62,11 +64,11 @@ pub const DEFAULT_SELF_MARK: u32 = 0x7475;
 /// Layout-compatible mirror of the kernel-side `TproxyConfig` in
 /// `totan-ebpf/src/main.rs`. Both sides **must** be updated in lock-step.
 ///
-/// Layout: `[u32 tproxy_ipv4_be][u16 tproxy_port_be][u16 _pad0][u32 fwmark][u32 _pad1]`
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct TproxyConfig {
     pub tproxy_ipv4_be: u32,
+    pub tproxy_ipv6_be: [u32; 4],
     pub tproxy_port_be: u16,
     pub _pad0: u16,
     pub fwmark: u32,
@@ -83,7 +85,13 @@ pub struct Loader {
     // Each element keeps one tcx attachment alive; drop = detach.
     links: Vec<aya::programs::tc::SchedClassifierLink>,
     fwmark: u32,
-    owned_routing: bool,
+    owned_routing: RoutingOwnership,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct RoutingOwnership {
+    ipv4_rule: bool,
+    ipv6_rule: bool,
 }
 
 impl Loader {
@@ -92,7 +100,8 @@ impl Loader {
     /// ordering. Policy routing is also configured automatically.
     pub fn load_and_attach(
         ingress_ifaces: &[&str],
-        tproxy_addr: Ipv4Addr,
+        tproxy_ipv4: Ipv4Addr,
+        tproxy_ipv6: Ipv6Addr,
         tproxy_port: u16,
         fwmark: u32,
     ) -> anyhow::Result<Self> {
@@ -109,7 +118,8 @@ impl Loader {
                 .ok_or_else(|| anyhow::anyhow!("TOTAN_CONFIG map not found in ELF"))?,
         )?;
         let cfg = TproxyConfig {
-            tproxy_ipv4_be: u32::from(tproxy_addr).to_be(),
+            tproxy_ipv4_be: u32::from(tproxy_ipv4).to_be(),
+            tproxy_ipv6_be: ipv6_to_be_words(tproxy_ipv6),
             tproxy_port_be: tproxy_port.to_be(),
             _pad0: 0,
             fwmark,
@@ -136,7 +146,8 @@ impl Loader {
             links.push(program.take_link(link_id)?);
             info!(
                 interface = iface,
-                tproxy = %format!("{}:{}", tproxy_addr, tproxy_port),
+                tproxy_ipv4 = %format!("{}:{}", tproxy_ipv4, tproxy_port),
+                tproxy_ipv6 = %format!("[{}]:{}", tproxy_ipv6, tproxy_port),
                 fwmark = format!("0x{:04X}", fwmark),
                 "totan eBPF tc ingress attached"
             );
@@ -176,10 +187,17 @@ impl Loader {
 impl Drop for Loader {
     fn drop(&mut self) {
         // _link drop detaches the tcx program automatically.
-        if self.owned_routing {
-            teardown_policy_routing(self.fwmark);
-        }
+        teardown_policy_routing(self.fwmark, self.owned_routing);
     }
+}
+
+fn ipv6_to_be_words(addr: Ipv6Addr) -> [u32; 4] {
+    let octets = addr.octets();
+    let mut words = [0u32; 4];
+    for (word, chunk) in words.iter_mut().zip(octets.chunks_exact(4)) {
+        *word = u32::from_be_bytes(chunk.try_into().expect("IPv6 chunks are four bytes")).to_be();
+    }
+    words
 }
 
 /// Install `ip rule` + `ip route` entries that make fwmark-tagged packets
@@ -187,50 +205,62 @@ impl Drop for Loader {
 ///
 /// Returns `true` if we installed the rules (so `Drop` can clean them up),
 /// `false` if they were already present.
-fn setup_policy_routing(fwmark: u32) -> anyhow::Result<bool> {
-    // `ip rule add fwmark <N> lookup 100 priority 100`
+fn setup_policy_routing(fwmark: u32) -> anyhow::Result<RoutingOwnership> {
+    let ipv4_rule = setup_policy_routing_for_family(fwmark, false)?;
+    let ipv6_rule = match setup_policy_routing_for_family(fwmark, true) {
+        Ok(owned) => owned,
+        Err(error) => {
+            if ipv4_rule {
+                teardown_policy_rule(fwmark, false);
+            }
+            return Err(error);
+        }
+    };
+    Ok(RoutingOwnership {
+        ipv4_rule,
+        ipv6_rule,
+    })
+}
+
+fn setup_policy_routing_for_family(fwmark: u32, ipv6: bool) -> anyhow::Result<bool> {
+    let family_args: &[&str] = if ipv6 { &["-6"] } else { &[] };
     let rule_check = Command::new("ip")
+        .args(family_args)
         .args(["rule", "show", "lookup", "100"])
         .output()?;
     let already_present =
         String::from_utf8_lossy(&rule_check.stdout).contains(&format!("0x{:x}", fwmark));
 
     if !already_present {
-        let s = run_cmd(&[
-            "ip",
-            "rule",
-            "add",
-            "fwmark",
-            &format!("0x{:x}", fwmark),
-            "lookup",
-            "100",
-            "priority",
-            "100",
-        ])?;
+        let mark = format!("0x{:x}", fwmark);
+        let mut rule_args = Vec::with_capacity(10);
+        rule_args.extend_from_slice(family_args);
+        rule_args.extend_from_slice(&[
+            "rule", "add", "fwmark", &mark, "lookup", "100", "priority", "100",
+        ]);
+        let s = Command::new("ip").args(&rule_args).status()?;
         if !s.success() {
             return Err(anyhow::anyhow!(
-                "`ip rule add fwmark` failed — is CAP_NET_ADMIN granted?"
+                "`ip {}rule add fwmark` failed — is CAP_NET_ADMIN granted?",
+                if ipv6 { "-6 " } else { "" }
             ));
         }
-        run_cmd(&[
-            "ip",
-            "route",
-            "add",
-            "local",
-            "0.0.0.0/0",
-            "dev",
-            "lo",
-            "table",
-            "100",
-        ])
-        .ok(); // may already exist
+        let prefix = if ipv6 { "::/0" } else { "0.0.0.0/0" };
+        if let Err(error) = ensure_local_route(prefix, family_args) {
+            teardown_policy_rule(fwmark, ipv6);
+            return Err(error);
+        }
         info!(
+            family = if ipv6 { "ipv6" } else { "ipv4" },
             fwmark = format!("0x{:04X}", fwmark),
             "policy routing configured"
         );
         Ok(true)
     } else {
+        let prefix = if ipv6 { "::/0" } else { "0.0.0.0/0" };
+        ensure_local_route(prefix, family_args)?;
         info!(
+            family = if ipv6 { "ipv6" } else { "ipv4" },
             fwmark = format!("0x{:04X}", fwmark),
             "policy routing already present"
         );
@@ -238,22 +268,46 @@ fn setup_policy_routing(fwmark: u32) -> anyhow::Result<bool> {
     }
 }
 
-fn teardown_policy_routing(fwmark: u32) {
-    run_cmd(&[
-        "ip",
-        "rule",
-        "del",
-        "fwmark",
-        &format!("0x{:x}", fwmark),
-        "lookup",
-        "100",
-    ])
-    .ok();
+fn ensure_local_route(prefix: &str, family_args: &[&str]) -> anyhow::Result<()> {
+    let output = Command::new("ip")
+        .args(family_args)
+        .args(["route", "show", "table", "100", "type", "local"])
+        .output()?;
+    if String::from_utf8_lossy(&output.stdout).contains(prefix) {
+        return Ok(());
+    }
+
+    let mut route_args = Vec::with_capacity(10);
+    route_args.extend_from_slice(family_args);
+    route_args.extend_from_slice(&["route", "add", "local", prefix, "dev", "lo", "table", "100"]);
+    let status = Command::new("ip").args(&route_args).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "failed to install local route {prefix} in table 100"
+        ))
+    }
+}
+
+fn teardown_policy_routing(fwmark: u32, owned: RoutingOwnership) {
+    if owned.ipv4_rule {
+        teardown_policy_rule(fwmark, false);
+    }
+    if owned.ipv6_rule {
+        teardown_policy_rule(fwmark, true);
+    }
     // Leave table 100 route in place — other consumers may share it.
 }
 
-fn run_cmd(args: &[&str]) -> anyhow::Result<std::process::ExitStatus> {
-    Ok(Command::new(args[0]).args(&args[1..]).status()?)
+fn teardown_policy_rule(fwmark: u32, ipv6: bool) {
+    let mark = format!("0x{:x}", fwmark);
+    let mut args = Vec::with_capacity(8);
+    if ipv6 {
+        args.push("-6");
+    }
+    args.extend_from_slice(&["rule", "del", "fwmark", &mark, "lookup", "100"]);
+    let _ = Command::new("ip").args(&args).status();
 }
 
 /// Enumerate `/sys/class/net` and return all interface names that match at
@@ -290,9 +344,35 @@ fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aya::programs::SchedClassifier;
 
     fn m(pattern: &str, name: &str) -> bool {
         glob_match(pattern.as_bytes(), name.as_bytes())
+    }
+
+    #[test]
+    fn tproxy_config_layout_is_stable() {
+        assert_eq!(core::mem::size_of::<TproxyConfig>(), 32);
+        assert_eq!(core::mem::align_of::<TproxyConfig>(), 4);
+        assert_eq!(
+            ipv6_to_be_words(Ipv6Addr::LOCALHOST),
+            [0, 0, 0, 1u32.to_be()]
+        );
+    }
+
+    /// Load the dual-stack tc classifier through the kernel verifier without
+    /// attaching it. Requires root/CAP_BPF and is exercised explicitly in CI.
+    #[test]
+    #[ignore]
+    fn load_tc_ingress_verifies() {
+        let elf = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/totan_bpf"));
+        let mut ebpf = EbpfLoader::new().load(elf).expect("load ELF + maps");
+        let program: &mut SchedClassifier = ebpf
+            .program_mut("totan_tc_ingress")
+            .expect("totan_tc_ingress present")
+            .try_into()
+            .expect("program is SchedClassifier");
+        program.load().expect("tc ingress must pass verifier");
     }
 
     #[test]

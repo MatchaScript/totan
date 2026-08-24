@@ -8,7 +8,10 @@ use tracing::{debug, warn};
 use crate::pac::PacEvaluator;
 use crate::proxy::{proxies_from_url_str, Proxies};
 use crate::upstream::UpstreamHandler;
-use crate::utils::{extract_http_host, extract_sni_hostname};
+use crate::utils::{
+    extract_http_host, extract_sni_hostname, format_authority_with_default,
+    socket_authority_with_default,
+};
 
 enum ProxyResolver {
     Pac(Arc<PacEvaluator>),
@@ -131,14 +134,14 @@ impl ConnectionManager {
             "http"
         };
         let default_port = if scheme == "https" { 443 } else { 80 };
-        let authority = if intercepted_conn.original_dest.port() == default_port {
-            hostname_for_url.clone()
-        } else {
-            format!(
-                "{}:{}",
-                hostname_for_url,
-                intercepted_conn.original_dest.port()
+        let authority = if sni_hostname.is_some() || http_host.is_some() {
+            format_authority_with_default(
+                &hostname_for_url,
+                intercepted_conn.original_dest.port(),
+                default_port,
             )
+        } else {
+            socket_authority_with_default(intercepted_conn.original_dest, default_port)
         };
         let target_url = format!("{}://{}/", scheme, authority);
 
