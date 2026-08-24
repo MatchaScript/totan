@@ -1,4 +1,3 @@
-use crate::types::InterceptionMode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -33,10 +32,6 @@ pub struct TotanConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 
-    /// Packet interception mode: "netfilter" or "ebpf"
-    #[serde(default)]
-    pub interception_mode: InterceptionMode,
-
     /// Logging configuration
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -49,11 +44,7 @@ pub struct TotanConfig {
     #[serde(default)]
     pub mitigation: ErrorMitigationConfig,
 
-    /// Netfilter-specific configuration (only consulted when `interception_mode = "netfilter"`)
-    #[serde(default)]
-    pub netfilter: NetfilterConfig,
-
-    /// eBPF-specific configuration (only consulted when `interception_mode = "ebpf"`)
+    /// eBPF interception configuration.
     #[serde(default)]
     pub ebpf: EbpfConfig,
 }
@@ -275,56 +266,12 @@ impl Default for TotanConfig {
             pac_cache_ttl_secs: default_pac_cache_ttl_secs(),
             pac_cache_max_entries: default_pac_cache_max_entries(),
             max_connections: default_max_connections(),
-            interception_mode: Default::default(),
             logging: Default::default(),
             timeouts: Default::default(),
             mitigation: Default::default(),
-            netfilter: Default::default(),
             ebpf: Default::default(),
         }
     }
-}
-
-/// Netfilter-mode rule management configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NetfilterConfig {
-    /// When `true`, totan installs nftables OUTPUT rules that redirect all
-    /// outbound IPv4/IPv6 TCP traffic on `redirect_ports` to family-matched
-    /// listeners. Packets marked
-    /// with `fwmark` (set on totan's own upstream sockets via `SO_MARK`) are
-    /// excluded to prevent redirect loops — this works regardless of the
-    /// running user.
-    ///
-    /// When `false` (default), totan does not touch nftables — manage rules
-    /// externally (e.g. via a system nftables config or Ansible).
-    #[serde(default)]
-    pub manage_rules: bool,
-
-    /// Socket mark (`SO_MARK`) applied to totan's own upstream TCP connections
-    /// and matched by `meta mark` in the nftables rule to prevent redirect
-    /// loops. Must not overlap with Cilium's mark range (0x0200–0x0E00).
-    /// Default: 0x7474.
-    #[serde(default = "default_fwmark")]
-    pub fwmark: u32,
-
-    /// TCP destination ports to intercept. Default: [80, 443].
-    #[serde(default = "default_redirect_ports")]
-    pub redirect_ports: Vec<u16>,
-}
-
-impl Default for NetfilterConfig {
-    fn default() -> Self {
-        Self {
-            manage_rules: false,
-            fwmark: default_fwmark(),
-            redirect_ports: default_redirect_ports(),
-        }
-    }
-}
-
-fn default_redirect_ports() -> Vec<u16> {
-    vec![80, 443]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,7 +365,7 @@ mod config_example_tests {
 
     #[test]
     fn unknown_nested_key_is_rejected() {
-        let res: Result<TotanConfig, _> = toml::from_str("[netfilter]\nexclude_uids = [0]\n");
+        let res: Result<TotanConfig, _> = toml::from_str("[ebpf]\nexclude_uids = [0]\n");
         assert!(
             res.is_err(),
             "unknown key in a nested section must be rejected"

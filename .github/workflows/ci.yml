@@ -7,58 +7,18 @@ on:
     branches: [main]
 
 jobs:
-  # ── fast checks on the default (netfilter-only) feature set ─────────────────
-  check:
-    name: Check & Test
+  build:
+    name: Check, Test & Build
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Check
-        run: cargo check --workspace --exclude totan-ebpf
-      - name: Clippy
-        run: cargo clippy --workspace --exclude totan-ebpf -- -D warnings
-      # totan-ebpf targets bpfel-unknown-none and requires nightly; it is
-      # compiled in the `ebpf-build` job below.
-      - name: Test
-        run: cargo test --workspace --exclude totan-ebpf
 
-  # ── build the default (netfilter) release binary reused by e2e-netfilter ───
-  build-netfilter:
-    name: Build (netfilter)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build totan (netfilter)
-        run: cargo build -p totan --release
-      - uses: actions/upload-artifact@v5
-        with:
-          name: totan-netfilter-release
-          path: target/release/totan
-          retention-days: 1
-
-  # ── compile the eBPF crate + userspace loader; publish as artifact ─────────
-  build-ebpf:
-    name: Build (eBPF)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-
-      # The nightly channel pinned in totan-ebpf/rust-toolchain.toml that
-      # aya-build invokes via `rustup run`.
       - name: Install nightly-2026-03-01 for the eBPF crate
         run: rustup toolchain install nightly-2026-03-01 --component rust-src --no-self-update
 
-      # Use the official static binary. Building bpf-linker from source binds
-      # CI to the runner's system LLVM version (v0.11 requires LLVM 23).
       - name: Cache bpf-linker
         id: cache-bpf-linker
         uses: actions/cache@v5
@@ -75,46 +35,32 @@ jobs:
           bpf-linker --version
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Build totan (with eBPF)
-        run: cargo build -p totan --features ebpf --release
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Check
+        run: cargo check --workspace --exclude totan-ebpf
+      - name: Clippy
+        run: cargo clippy --workspace --exclude totan-ebpf --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace --exclude totan-ebpf
+      - name: Build release binary
+        run: cargo build -p totan --release
 
       - uses: actions/upload-artifact@v5
         with:
-          name: totan-ebpf-release
+          name: totan-release
           path: target/release/totan
           retention-days: 1
 
-  # ── functional e2e: netfilter mode (iptables REDIRECT + SO_ORIGINAL_DST) ───
-  # Shares scenarios with e2e-ebpf via toolkit/e2e/run.sh.
-  e2e-netfilter:
-    name: E2E (netfilter, PAC routing)
-    runs-on: ubuntu-24.04
-    needs: build-netfilter
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
-        with:
-          name: totan-netfilter-release
-          path: target/release/
-      - name: Make totan executable
-        run: chmod +x target/release/totan
-      - name: Install nftables
-        run: sudo apt-get update && sudo apt-get install -y nftables
-      - name: Run netfilter e2e
-        run: sudo --preserve-env=PATH bash toolkit/e2e/run.sh netfilter
-
-  # ── functional e2e: eBPF mode (tcx + bpf_sk_assign TPROXY) ─────────────────
-  # Requires kernel ≥ 6.6 for tcx; ubuntu-24.04 runner has kernel 6.8.
-  e2e-ebpf:
+  e2e:
     name: E2E (eBPF, PAC routing)
     runs-on: ubuntu-24.04
-    needs: build-ebpf
+    needs: build
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
-          name: totan-ebpf-release
+          name: totan-release
           path: target/release/
       - name: Make totan executable
         run: chmod +x target/release/totan
@@ -123,39 +69,18 @@ jobs:
           echo "kernel: $(uname -r)"
           uname -r | awk -F. '{exit !(($1 > 6) || ($1 == 6 && $2 >= 6))}'
       - name: Run eBPF e2e
-        run: sudo --preserve-env=PATH bash toolkit/e2e/run.sh ebpf
+        run: sudo --preserve-env=PATH bash toolkit/e2e/run.sh
 
-  # ── stress / performance tests ────────────────────────────────────────────────
-  # Only runs on push to main so PR feedback stays fast.
-  # Thresholds can be overridden via env: TOTAN_STRESS_MIN_RPS, TOTAN_STRESS_MAX_FAIL_PCT.
-  stress-netfilter:
-    name: Stress (netfilter)
-    runs-on: ubuntu-24.04
-    if: github.event_name == 'push'
-    needs: build-netfilter
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
-        with:
-          name: totan-netfilter-release
-          path: target/release/
-      - name: Make totan executable
-        run: chmod +x target/release/totan
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y nftables apache2-utils
-      - name: Run netfilter stress test
-        run: sudo --preserve-env=PATH bash toolkit/e2e/stress.sh netfilter
-
-  stress-ebpf:
+  stress:
     name: Stress (eBPF)
     runs-on: ubuntu-24.04
     if: github.event_name == 'push'
-    needs: build-ebpf
+    needs: build
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
-          name: totan-ebpf-release
+          name: totan-release
           path: target/release/
       - name: Make totan executable
         run: chmod +x target/release/totan
@@ -166,4 +91,4 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y apache2-utils
       - name: Run eBPF stress test
-        run: sudo --preserve-env=PATH bash toolkit/e2e/stress.sh ebpf
+        run: sudo --preserve-env=PATH bash toolkit/e2e/stress.sh

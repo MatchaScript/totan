@@ -368,7 +368,7 @@ mod tests {
     /// Verifier smoke test for the IPv4/IPv6 cgroup hooks. Loading runs the
     /// verifier without attaching to any cgroup. Requires root (BPF_PROG_LOAD).
     /// Ignored by default; run with:
-    ///   sudo -E $(which cargo) test -p totan --features ebpf load_connect4_verifies -- --ignored --nocapture
+    ///   sudo -E $(which cargo) test -p totan load_connect4_verifies -- --ignored --nocapture
     #[test]
     #[ignore]
     fn load_connect_hooks_verify() {

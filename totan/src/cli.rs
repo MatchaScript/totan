@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -24,10 +24,6 @@ pub struct CliArgs {
     #[arg(long)]
     pub pac_cache_size: Option<usize>,
 
-    /// Packet interception mode
-    #[arg(short, long, value_enum)]
-    pub mode: Option<InterceptionModeArg>,
-
     /// Configuration file path
     #[arg(short, long)]
     pub config: Option<PathBuf>,
@@ -41,29 +37,12 @@ pub struct CliArgs {
     pub log_format: Option<String>,
 
     /// Enable cgroup-based interception of host-originated traffic
-    /// (kubelet, containerd, dnf, etc.). Requires --mode ebpf.
+    /// (kubelet, containerd, dnf, etc.).
     /// When set, totan attaches `cgroup/connect4` + `sockops` BPF programs
     /// to the slice paths in the [ebpf.host_hooks] config (or the defaults
     /// if the section is absent).
     #[arg(long, default_value_t = false)]
     pub ebpf_host_hooks: bool,
-}
-
-#[derive(Clone, Debug, ValueEnum)]
-pub enum InterceptionModeArg {
-    Netfilter,
-    #[cfg(feature = "ebpf")]
-    Ebpf,
-}
-
-impl From<InterceptionModeArg> for totan_common::InterceptionMode {
-    fn from(mode: InterceptionModeArg) -> Self {
-        match mode {
-            InterceptionModeArg::Netfilter => totan_common::InterceptionMode::Netfilter,
-            #[cfg(feature = "ebpf")]
-            InterceptionModeArg::Ebpf => totan_common::InterceptionMode::Ebpf,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -97,15 +76,6 @@ mod tests {
         .unwrap();
         assert_eq!(args.pac_file, Some(PathBuf::from("/etc/proxy.pac")));
         assert_eq!(args.pac_cache_ttl, Some(300));
-    }
-
-    #[test]
-    fn test_cli_parsing_mode() {
-        let args = CliArgs::try_parse_from(["totan", "--mode", "netfilter"]).unwrap();
-        match args.mode {
-            Some(InterceptionModeArg::Netfilter) => (),
-            _ => panic!("Expected Netfilter mode"),
-        }
     }
 
     #[test]

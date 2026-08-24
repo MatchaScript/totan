@@ -271,9 +271,12 @@ fn setup_policy_routing_for_family(fwmark: u32, ipv6: bool) -> anyhow::Result<bo
 fn ensure_local_route(prefix: &str, family_args: &[&str]) -> anyhow::Result<()> {
     let output = Command::new("ip")
         .args(family_args)
-        .args(["route", "show", "table", "100", "type", "local"])
+        .args(["route", "show", "table", "100", "type", "local", prefix])
         .output()?;
-    if String::from_utf8_lossy(&output.stdout).contains(prefix) {
+    // iproute2 renders 0.0.0.0/0 and ::/0 as "default", so checking the
+    // printed prefix is not portable. A filtered query with non-empty output
+    // is authoritative regardless of the display spelling.
+    if output.status.success() && !output.stdout.is_empty() {
         return Ok(());
     }
 

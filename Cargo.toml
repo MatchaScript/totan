@@ -8,8 +8,8 @@ members = [
 
 # `totan-ebpf` targets `bpfel-unknown-none` via its own `.cargo/config.toml`
 # and must not be built as part of the default cargo invocation for the host
-# toolchain. The userspace `totan` crate's `build.rs` drives its compilation
-# through `aya-build` when the `ebpf` feature is enabled.
+# toolchain. The userspace `totan` crate's `build.rs` always drives its
+# compilation through `aya-build`.
 default-members = [
 	"totan",
 	"totan-common",
@@ -56,7 +56,6 @@ anyhow = "1"
 url = { version = "2", features = ["serde"] }
 httparse = "1"
 socket2 = "0.6"
-nix = { version = "0.31.2", features = ["socket", "net", "user"] }
 boa_engine = "0.21"
 boa_gc = "0.21"
 glob = "0.3"

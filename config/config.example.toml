@@ -24,19 +24,12 @@ default_proxy = "http://proxy.example.com:8080"
 #   }
 pac_file = "/etc/totan/config.pac"
 
-# Packet interception mode: "netfilter" or "ebpf".
-#
-# netfilter — Intercepts traffic via nftables/iptables hooks (OUTPUT for host
-#   processes, PREROUTING for forwarded/container traffic). Works for both
-#   programs running on the host AND container workloads.
-#   Nftables redirect rules must be configured separately, e.g.:
-#     nft add rule ip totan output meta skuid 1000 tcp dport {80,443} redirect to :3129
-#
-# ebpf      — Attaches a tc ingress BPF program (via tcx) to a named network
+# Traffic interception uses eBPF exclusively. The tc ingress program (via tcx)
+# attaches to named network
 #   interface — typically the host-side veth peer of a container/pod. Intercepts
 #   traffic arriving FROM containers at that interface.
 #
-#   eBPF mode has two complementary interception paths:
+#   totan has two complementary interception paths:
 #     - tc ingress (ingress_interfaces) — container/pod traffic arriving at a
 #       host-side veth/netkit peer.
 #     - cgroup host hooks ([ebpf.host_hooks]) — host-originated egress (systemd
@@ -46,7 +39,6 @@ pac_file = "/etc/totan/config.pac"
 #       looping its own upstream traffic.
 #
 #   Requires: Linux kernel ≥ 6.6 (tcx multi-prog support), CAP_NET_ADMIN + CAP_BPF.
-interception_mode = "netfilter"
 
 [logging]
 # Log level: "trace", "debug", "info", "warn", or "error".
@@ -60,28 +52,7 @@ upstream_connect_ms = 3000
 # Client connection idle timeout in seconds.
 client_idle_secs = 600
 
-# ── Netfilter-specific settings (only apply when interception_mode = "netfilter") ─
-[netfilter]
-# Set to true to let totan manage nftables rules automatically.
-# When true, totan installs an OUTPUT nat hook that redirects ALL outbound TCP
-# traffic on redirect_ports to its listener. totan's own upstream connections
-# are tagged with `fwmark` (SO_MARK) and returned early by the rule, preventing
-# redirect loops regardless of which user totan runs as. Rules are removed on
-# shutdown.
-#
-# When false (default), totan does not touch nftables — configure rules
-# externally (e.g. via system nftables config, Ansible, or manually).
-manage_rules = false
-
-# Socket mark (SO_MARK) totan sets on its own upstream connections and matches
-# with `meta mark <fwmark> return` to prevent redirect loops. Default: 0x7474.
-# Avoid Cilium's reserved range (0x0200–0x0E00).
-# fwmark = 0x7474
-
-# TCP destination ports to intercept. Default: [80, 443].
-redirect_ports = [80, 443]
-
-# ── eBPF-specific settings (only apply when interception_mode = "ebpf") ───────
+# ── eBPF interception settings ────────────────────────────────────────────────
 [ebpf]
 # Host-side network interfaces where container/pod traffic arrives. Accepts a
 # list of names or glob patterns (`*`, `?`); every matching interface is
@@ -91,8 +62,7 @@ redirect_ports = [80, 443]
 ingress_interfaces = ["veth-host"]
 
 # Port for the IP_TRANSPARENT TPROXY listener. Defaults to listen_port.
-# Override when the TPROXY socket needs a different port from the netfilter
-# listener (e.g. to avoid conflicts in dual-mode deployments).
+# Override when the TPROXY socket needs a different port from listen_port.
 # tproxy_port = 3129
 
 # fwmark placed on intercepted packets for policy routing. The value triggers

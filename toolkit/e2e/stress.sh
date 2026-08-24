@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stress and performance test for totan using Apache Bench.
 #
-# Usage: stress.sh <netfilter|ebpf>
+# Usage: stress.sh
 #
 # Sends ab traffic through totan's transparent interception and validates:
 #   - Failed request rate ≤ MAX_FAIL_PCT (default 1%)
@@ -10,21 +10,13 @@
 # Uses a single mock proxy (no PAC) to keep the focus on totan's raw
 # connection-handling throughput rather than PAC evaluation overhead.
 #
-# Interception setup mirrors toolkit/e2e/run.sh:
-#   netfilter: nftables OUTPUT redirect scoped to uid $TEST_UID; ab runs as
-#              that uid so its TCP traffic to RFC-5737 IPs is intercepted.
-#   ebpf:      veth pair + pod netns; ab runs inside the pod netns.
+# Interception setup mirrors toolkit/e2e/run.sh: a veth pair and pod netns;
+# ab runs inside the pod netns.
 #
 # The target IPs are documentation space — permanently unreachable without
 # the test routes — so successful IPv4/IPv6 responses prove interception.
 
 set -euo pipefail
-
-MODE="${1:-}"
-case "$MODE" in
-    netfilter|ebpf) ;;
-    *) echo "usage: $0 <netfilter|ebpf>" >&2; exit 2 ;;
-esac
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOLKIT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -36,10 +28,9 @@ TOTAN_CFG="$LOG_DIR/totan.toml"
 TOTAN_LOG="$LOG_DIR/totan.log"
 PROXY_LOG="$LOG_DIR/proxy.log"
 
-# Separate uid/user from run.sh (9999) so the two can coexist on the same host.
-TEST_UID=9998
-TEST_USER="totan-stress-client"
 POD_NS="totan-stress-pod"
+PREEXISTING_V4_LOCAL_ROUTE="$(ip route show table 100 type local 0.0.0.0/0)"
+PREEXISTING_V6_LOCAL_ROUTE="$(ip -6 route show table 100 type local ::/0)"
 
 PROXY_PID=""
 TOTAN_PID=""
@@ -56,17 +47,12 @@ cleanup() {
     [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null
     wait 2>/dev/null
 
-    if [[ "$MODE" == "netfilter" ]]; then
-        nft delete table inet totan_stress 2>/dev/null
-        ip -6 route del local 2001:db8::/32 dev lo table local 2>/dev/null
-    else
-        ip rule del fwmark 0x7474 lookup 100 2>/dev/null
+    [[ -z "$PREEXISTING_V4_LOCAL_ROUTE" ]] && \
         ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
-        ip -6 rule del fwmark 0x7474 lookup 100 2>/dev/null
+    [[ -z "$PREEXISTING_V6_LOCAL_ROUTE" ]] && \
         ip -6 route del local ::/0 dev lo table 100 2>/dev/null
-        ip netns del "$POD_NS" 2>/dev/null
-        ip link del veth-st-host 2>/dev/null
-    fi
+    ip netns del "$POD_NS" 2>/dev/null
+    ip link del veth-st-host 2>/dev/null
 
     if [[ "${_STRESS_PASS:-0}" == "1" ]]; then
         rm -rf "$LOG_DIR"
@@ -99,8 +85,6 @@ ss -tlnH "sport = :8880" | grep -q "8880" \
 cat > "$TOTAN_CFG" <<TOML
 listen_port       = 3129
 default_proxy     = "http://127.0.0.1:8880"
-interception_mode = "$MODE"
-
 [logging]
 level  = "warn"
 format = "text"
@@ -108,53 +92,38 @@ format = "text"
 [timeouts]
 upstream_connect_ms = 5000
 client_idle_secs    = 30
+
+[ebpf]
+ingress_interfaces = ["veth-st-host"]
 TOML
 
-if [[ "$MODE" == "ebpf" ]]; then
-    printf '[ebpf]\ningress_interfaces = ["veth-st-host"]\n' >> "$TOTAN_CFG"
-fi
+# ── eBPF interception setup ──────────────────────────────────────────────────
+echo "[stress] setting up pod netns..."
+sysctl -qw net.ipv4.conf.all.rp_filter=0
+sysctl -qw net.ipv4.tcp_tw_reuse=1
 
-# ── interception setup ────────────────────────────────────────────────────────
-if [[ "$MODE" == "netfilter" ]]; then
-    echo "[stress] netfilter: creating test uid $TEST_UID ($TEST_USER)..."
-    if ! id -u "$TEST_USER" >/dev/null 2>&1; then
-        useradd -u "$TEST_UID" -M -s /bin/bash "$TEST_USER" 2>/dev/null \
-            || useradd -u "$TEST_UID" -M "$TEST_USER"
-    fi
-    nft add table inet totan_stress
-    nft add chain inet totan_stress output '{ type nat hook output priority -100; policy accept; }'
-    nft add rule inet totan_stress output "meta skuid $TEST_UID tcp dport { 80 } redirect to :3129"
-    ip -6 route add local 2001:db8::/32 dev lo table local
-    AB_PREFIX=(sudo -u "$TEST_USER" --preserve-env=PATH)
+ip netns add "$POD_NS"
+ip link add veth-st-host type veth peer name veth-st-pod
+ip link set veth-st-pod netns "$POD_NS"
+ip link set veth-st-host up
+ip addr add 10.101.0.1/24 dev veth-st-host
+ip -6 addr add fd00:101::1/64 dev veth-st-host nodad
+sysctl -qw net.ipv4.conf.veth-st-host.rp_filter=0 2>/dev/null || true
 
-else  # ebpf
-    echo "[stress] ebpf: setting up pod netns..."
-    sysctl -qw net.ipv4.conf.all.rp_filter=0
-    sysctl -qw net.ipv4.tcp_tw_reuse=1
+ip netns exec "$POD_NS" ip link set lo up
+ip netns exec "$POD_NS" ip link set veth-st-pod up
+ip netns exec "$POD_NS" ip addr add 10.101.0.2/24 dev veth-st-pod
+ip netns exec "$POD_NS" ip route add default via 10.101.0.1
+ip netns exec "$POD_NS" ip -6 addr add fd00:101::2/64 dev veth-st-pod nodad
+ip netns exec "$POD_NS" ip -6 route add default via fd00:101::1
+ip netns exec "$POD_NS" sysctl -qw net.ipv4.tcp_tw_reuse=1
+ip netns exec "$POD_NS" sysctl -qw net.ipv4.tcp_fin_timeout=5
+ip netns exec "$POD_NS" sysctl -qw net.ipv4.ip_local_port_range="1024 65535"
 
-    ip netns add "$POD_NS"
-    ip link add veth-st-host type veth peer name veth-st-pod
-    ip link set veth-st-pod netns "$POD_NS"
-    ip link set veth-st-host up
-    ip addr add 10.101.0.1/24 dev veth-st-host
-    ip -6 addr add fd00:101::1/64 dev veth-st-host nodad
-    sysctl -qw net.ipv4.conf.veth-st-host.rp_filter=0 2>/dev/null || true
-
-    ip netns exec "$POD_NS" ip link set lo up
-    ip netns exec "$POD_NS" ip link set veth-st-pod up
-    ip netns exec "$POD_NS" ip addr add 10.101.0.2/24 dev veth-st-pod
-    ip netns exec "$POD_NS" ip route add default via 10.101.0.1
-    ip netns exec "$POD_NS" ip -6 addr add fd00:101::2/64 dev veth-st-pod nodad
-    ip netns exec "$POD_NS" ip -6 route add default via fd00:101::1
-    ip netns exec "$POD_NS" sysctl -qw net.ipv4.tcp_tw_reuse=1
-    ip netns exec "$POD_NS" sysctl -qw net.ipv4.tcp_fin_timeout=5
-    ip netns exec "$POD_NS" sysctl -qw net.ipv4.ip_local_port_range="1024 65535"
-
-    AB_PREFIX=(ip netns exec "$POD_NS")
-fi
+AB_PREFIX=(ip netns exec "$POD_NS")
 
 # ── start totan ───────────────────────────────────────────────────────────────
-echo "[stress] starting totan ($MODE)..."
+echo "[stress] starting totan..."
 "$TOTAN_BIN" --config "$TOTAN_CFG" >"$TOTAN_LOG" 2>&1 &
 TOTAN_PID=$!
 for i in $(seq 1 30); do
@@ -162,7 +131,7 @@ for i in $(seq 1 30); do
     sleep 0.1
     [[ $i -eq 30 ]] && { echo "[stress] totan failed to start" >&2; exit 1; }
 done
-[[ "$MODE" == "ebpf" ]] && sleep 0.5
+sleep 0.5
 
 TARGET_V4="http://192.0.2.10/"       # RFC 5737
 TARGET_V6="http://[2001:db8::10]/"   # RFC 3849
@@ -258,7 +227,7 @@ run_mixed_bench "mixed-burst" 500 25
 # ── verdict ───────────────────────────────────────────────────────────────────
 echo
 echo "═══════════════════════════════════════════════════════════════════════"
-echo "  mode: $MODE    passed: $pass    failed: $fail"
+echo "  eBPF    passed: $pass    failed: $fail"
 echo "═══════════════════════════════════════════════════════════════════════"
 
 [[ "$fail" -gt 0 ]] && exit 1

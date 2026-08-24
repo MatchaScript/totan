@@ -9,17 +9,6 @@ pub struct InterceptedConnection {
     pub sni_hostname: Option<String>,
 }
 
-/// Proxy mode enumeration
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[derive(Default)]
-pub enum InterceptionMode {
-    #[default]
-    Netfilter,
-    #[cfg(feature = "ebpf")]
-    Ebpf,
-}
-
 /// Upstream proxy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {

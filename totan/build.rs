@@ -1,9 +1,5 @@
 //! Build-time driver for the eBPF kernel-space crate.
 //!
-//! Only active under the `ebpf` cargo feature — the netfilter-only default
-//! build requires neither bpf-linker nor a nightly toolchain.
-
-#[cfg(feature = "ebpf")]
 fn main() {
     use aya_build::{Package, Toolchain};
 
@@ -21,6 +17,3 @@ fn main() {
     )
     .expect("failed to build totan-ebpf");
 }
-
-#[cfg(not(feature = "ebpf"))]
-fn main() {}

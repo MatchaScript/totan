@@ -11,8 +11,6 @@ default_proxy = "http://127.0.0.1:8880"
 # run.sh at startup with the absolute path to toolkit/e2e/test.pac.
 pac_file = "__PAC_PATH__"
 
-interception_mode = "ebpf"
-
 [logging]
 level = "debug"
 format = "text"
@@ -41,5 +39,5 @@ fwmark = 0x7474
 # at /sys/fs/cgroup/totan-e2e.slice before totan starts, and host-side curls
 # are launched into it by writing $$ to cgroup.procs.
 [ebpf.host_hooks]
-redirect_port = 3130
+redirect_port = 33130
 slices = ["/sys/fs/cgroup/totan-e2e.slice"]

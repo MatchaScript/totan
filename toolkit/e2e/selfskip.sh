@@ -34,7 +34,7 @@ cleanup() {
 trap cleanup EXIT
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (sudo)"; exit 1; }
-[[ -x "$TOTAN_BIN" ]] || { echo "build first: cargo build -p totan --features ebpf --release"; exit 1; }
+[[ -x "$TOTAN_BIN" ]] || { echo "build first: cargo build -p totan --release"; exit 1; }
 
 # ── backend on 127.0.0.2:80 (DIRECT target) ──────────────────────────────────
 cat > "$BACKEND_PY" <<'PY'
@@ -55,7 +55,6 @@ sleep 0.5
 echo 'function FindProxyForURL(url, host) { return "DIRECT"; }' > "$PAC"
 cat > "$CFG" <<EOF
 listen_port = 3129
-interception_mode = "ebpf"
 pac_file = "$PAC"
 
 [logging]
@@ -66,7 +65,7 @@ format = "text"
 ingress_interfaces = []
 
 [ebpf.host_hooks]
-redirect_port = 3130
+redirect_port = 33130
 slices = ["$SLICE"]
 EOF
 
@@ -79,13 +78,13 @@ bash -c 'echo $$ > "'"$SLICE"'/cgroup.procs"; exec "$1" --config "$2"' \
     _ "$TOTAN_BIN" "$CFG" >"$TOTAN_LOG" 2>&1 &
 TOTAN_PID=$!
 
-# host-hooks-only binds only the redirect listener (3130), never the tproxy one.
+# host-hooks-only binds only the redirect listener (33130), never the tproxy one.
 for i in $(seq 1 50); do
-    ss -tlnH 'sport = :3130' | grep -q 3130 && break
+    ss -tlnH 'sport = :33130' | grep -q 33130 && break
     sleep 0.1
-    [[ $i -eq 50 ]] && { echo "FAIL: totan did not bind :3130"; echo "--- log ---"; cat "$TOTAN_LOG"; exit 1; }
+    [[ $i -eq 50 ]] && { echo "FAIL: totan did not bind :33130"; echo "--- log ---"; cat "$TOTAN_LOG"; exit 1; }
 done
-echo "✓ host-hooks-only mode started in-slice (bound :3130, no interfaces configured)"
+echo "✓ host-hooks-only mode started in-slice (bound :33130, no interfaces configured)"
 grep -qx "$TOTAN_PID" "$SLICE/cgroup.procs" || { echo "FAIL: totan not in slice"; exit 1; }
 echo "✓ totan running inside $SLICE"
 

@@ -31,28 +31,6 @@ services:
       - HTTPS_PROXY=http://squid:3128
       - NO_PROXY=localhost,127.0.0.1,nginx
     command: ["sleep", "infinity"]
-  totan:
-    build:
-      context: .
-      dockerfile: toolkit/Dockerfile
-    container_name: totan-client
-    cap_add:
-      - NET_ADMIN
-    volumes:
-      - ./toolkit/totan.docker.toml:/etc/totan/totan.toml:ro
-      - ./toolkit/proxy.pac:/etc/totan/proxy.pac:ro
-      - ./target/release/totan:/opt/totan/totan:ro
-    environment:
-      - NO_PROXY=localhost,127.0.0.1,nginx
-      - no_proxy=localhost,127.0.0.1,nginx
-      - PORT=3129
-      - USER_NAME=totan
-      - TEST_UID=999
-    depends_on:
-      - squid
-      - nginx
-    command: ["/usr/local/bin/start-totan.sh"]
-
   go-transproxy:
     build:
       context: .

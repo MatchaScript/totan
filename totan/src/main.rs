@@ -21,19 +21,17 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting totan transparent proxy");
     info!("Configuration loaded successfully");
 
-    // Create packet interceptor based on mode
-    let mode = config.interception_mode;
+    // Create the eBPF packet interceptor.
     let interceptor = PacketInterceptor::new(config.clone())?;
-    info!("Packet interceptor initialized in {:?} mode", mode);
+    info!("eBPF packet interceptor initialized");
 
     // Create connection manager
     let connection_manager = Arc::new(ConnectionManager::new(config.clone()).await?);
     info!("Connection manager initialized");
 
     // Setup graceful shutdown. SIGTERM is the default stop signal for systemd,
-    // Docker and Kubernetes; without it, RAII cleanup (nftables table, eBPF
-    // policy routing) would be skipped on the most common production shutdown
-    // path, leaving redirect rules installed system-wide.
+    // Docker and Kubernetes; without it, eBPF and policy-routing RAII cleanup
+    // would be skipped on the most common production shutdown path.
     let shutdown_signal = async {
         #[cfg(unix)]
         {
@@ -114,10 +112,6 @@ fn load_config(args: &CliArgs) -> anyhow::Result<TotanConfig> {
     }
     if let Some(size) = args.pac_cache_size {
         config.pac_cache_max_entries = size;
-    }
-
-    if let Some(mode) = &args.mode {
-        config.interception_mode = mode.clone().into();
     }
 
     // CLI flag turns on host hooks if config didn't already do so. The

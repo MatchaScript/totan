@@ -85,9 +85,7 @@ impl ProxyHttp for TotanHttpProxy {
         let port = self.upstream_proxy.port().unwrap_or(80);
         let mut peer = HttpPeer::new((host, port), false, "".to_string());
 
-        // In netfilter mode the OUTPUT hook would re-intercept totan's own
-        // upstream connection; SO_MARK tags it so the nftables rule skips it.
-        // In eBPF mode upstream_mark is 0 and no hook is installed.
+        // cgroup/connect4 skips totan's own upstream sockets by this SO_MARK.
         if self.upstream_mark != 0 {
             let mark = self.upstream_mark;
             peer.options.upstream_tcp_sock_tweak_hook = Some(Arc::new(move |sock| {
