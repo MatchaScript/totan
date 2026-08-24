@@ -15,8 +15,8 @@
 #              that uid so its TCP traffic to RFC-5737 IPs is intercepted.
 #   ebpf:      veth pair + pod netns; ab runs inside the pod netns.
 #
-# The target IP (192.0.2.10) is RFC 5737 documentation space — permanently
-# unreachable — so any successful ab response proves totan proxied the flow.
+# The target IPs are documentation space — permanently unreachable without
+# the test routes — so successful IPv4/IPv6 responses prove interception.
 
 set -euo pipefail
 
@@ -58,9 +58,12 @@ cleanup() {
 
     if [[ "$MODE" == "netfilter" ]]; then
         nft delete table inet totan_stress 2>/dev/null
+        ip -6 route del local 2001:db8::/32 dev lo table local 2>/dev/null
     else
         ip rule del fwmark 0x7474 lookup 100 2>/dev/null
         ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
+        ip -6 rule del fwmark 0x7474 lookup 100 2>/dev/null
+        ip -6 route del local ::/0 dev lo table 100 2>/dev/null
         ip netns del "$POD_NS" 2>/dev/null
         ip link del veth-st-host 2>/dev/null
     fi
@@ -121,6 +124,7 @@ if [[ "$MODE" == "netfilter" ]]; then
     nft add table inet totan_stress
     nft add chain inet totan_stress output '{ type nat hook output priority -100; policy accept; }'
     nft add rule inet totan_stress output "meta skuid $TEST_UID tcp dport { 80 } redirect to :3129"
+    ip -6 route add local 2001:db8::/32 dev lo table local
     AB_PREFIX=(sudo -u "$TEST_USER" --preserve-env=PATH)
 
 else  # ebpf
@@ -133,12 +137,15 @@ else  # ebpf
     ip link set veth-st-pod netns "$POD_NS"
     ip link set veth-st-host up
     ip addr add 10.101.0.1/24 dev veth-st-host
+    ip -6 addr add fd00:101::1/64 dev veth-st-host nodad
     sysctl -qw net.ipv4.conf.veth-st-host.rp_filter=0 2>/dev/null || true
 
     ip netns exec "$POD_NS" ip link set lo up
     ip netns exec "$POD_NS" ip link set veth-st-pod up
     ip netns exec "$POD_NS" ip addr add 10.101.0.2/24 dev veth-st-pod
     ip netns exec "$POD_NS" ip route add default via 10.101.0.1
+    ip netns exec "$POD_NS" ip -6 addr add fd00:101::2/64 dev veth-st-pod nodad
+    ip netns exec "$POD_NS" ip -6 route add default via fd00:101::1
     ip netns exec "$POD_NS" sysctl -qw net.ipv4.tcp_tw_reuse=1
     ip netns exec "$POD_NS" sysctl -qw net.ipv4.tcp_fin_timeout=5
     ip netns exec "$POD_NS" sysctl -qw net.ipv4.ip_local_port_range="1024 65535"
@@ -157,26 +164,20 @@ for i in $(seq 1 30); do
 done
 [[ "$MODE" == "ebpf" ]] && sleep 0.5
 
-TARGET="http://192.0.2.10/"   # RFC 5737: unreachable without totan interception
+TARGET_V4="http://192.0.2.10/"       # RFC 5737
+TARGET_V6="http://[2001:db8::10]/"   # RFC 3849
 pass=0
 fail=0
 
 # ── warm-up ───────────────────────────────────────────────────────────────────
 echo "[stress] warming up..."
-"${AB_PREFIX[@]}" ab -n 30 -c 3 -s 10 "$TARGET" >/dev/null 2>&1 || true
+"${AB_PREFIX[@]}" ab -n 30 -c 3 -s 10 "$TARGET_V4" >/dev/null 2>&1 || true
+"${AB_PREFIX[@]}" ab -n 30 -c 3 -s 10 "$TARGET_V6" >/dev/null 2>&1 || true
 sleep 0.2
 
-# ── benchmark runner ──────────────────────────────────────────────────────────
-run_bench() {
-    local label="$1" n="$2" c="$3"
-    local out="$LOG_DIR/ab-${label}.txt"
-
-    echo
-    echo "── $label: $n requests, concurrency=$c ─────────────────────────────"
-
-    # ab exits non-zero on failures; capture output regardless.
-    "${AB_PREFIX[@]}" ab -n "$n" -c "$c" -s 10 "$TARGET" >"$out" 2>&1 || true
-
+# ── benchmark result validation ───────────────────────────────────────────────
+assess_bench() {
+    local label="$1" out="$2"
     # Print the summary block, or the raw output when no summary was produced.
     if grep -q '^Server Software:' "$out" 2>/dev/null; then
         awk '/^Server Software:/,0' "$out"
@@ -216,12 +217,43 @@ run_bench() {
     fi
 }
 
+# ── benchmark runners ─────────────────────────────────────────────────────────
+run_bench() {
+    local label="$1" n="$2" c="$3" target="$4"
+    local out="$LOG_DIR/ab-${label}.txt"
+
+    echo
+    echo "── $label: $n requests, concurrency=$c ─────────────────────────────"
+    "${AB_PREFIX[@]}" ab -n "$n" -c "$c" -s 10 "$target" >"$out" 2>&1 || true
+    assess_bench "$label" "$out"
+}
+
+run_mixed_bench() {
+    local label="$1" n="$2" c="$3"
+    local out_v4="$LOG_DIR/ab-${label}-ipv4.txt"
+    local out_v6="$LOG_DIR/ab-${label}-ipv6.txt"
+
+    echo
+    echo "── $label: 2 x $n requests, concurrency=$c per family ───────────────"
+    "${AB_PREFIX[@]}" ab -n "$n" -c "$c" -s 10 "$TARGET_V4" >"$out_v4" 2>&1 &
+    local pid_v4=$!
+    "${AB_PREFIX[@]}" ab -n "$n" -c "$c" -s 10 "$TARGET_V6" >"$out_v6" 2>&1 &
+    local pid_v6=$!
+    wait "$pid_v4" || true
+    wait "$pid_v6" || true
+
+    assess_bench "${label}-ipv4" "$out_v4"
+    assess_bench "${label}-ipv6" "$out_v6"
+}
+
 # ── benchmarks ────────────────────────────────────────────────────────────────
-run_bench "moderate"   500  10   # baseline throughput
+run_bench "ipv4-moderate" 500 10 "$TARGET_V4"
 sleep 3
-run_bench "sustained" 2000  20   # sustained mixed load (before burst to avoid state accumulation)
+run_bench "ipv6-moderate" 500 10 "$TARGET_V6"
 sleep 3
-run_bench "burst"     1000  50   # high concurrency spike
+run_mixed_bench "mixed-sustained" 1000 10
+sleep 3
+run_mixed_bench "mixed-burst" 500 25
 
 # ── verdict ───────────────────────────────────────────────────────────────────
 echo
