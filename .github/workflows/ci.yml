@@ -131,7 +131,7 @@ jobs:
   stress-netfilter:
     name: Stress (netfilter)
     runs-on: ubuntu-24.04
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    if: github.event_name == 'push'
     needs: build-netfilter
     steps:
       - uses: actions/checkout@v5
@@ -149,7 +149,7 @@ jobs:
   stress-ebpf:
     name: Stress (eBPF)
     runs-on: ubuntu-24.04
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    if: github.event_name == 'push'
     needs: build-ebpf
     steps:
       - uses: actions/checkout@v5
