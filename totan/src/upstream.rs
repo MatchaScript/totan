@@ -1,6 +1,6 @@
 use crate::http_proxy::{serve_http_connection, HttpProxyContext};
 use crate::proxy::{HostAndPort, Proxies, Proxy, ProxyOrDirect};
-use crate::utils::tolerant_copy_bidirectional;
+use crate::utils::{format_authority, socket_authority, tolerant_copy_bidirectional};
 use anyhow::{anyhow, Result};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -274,11 +274,10 @@ impl UpstreamHandler {
     where
         U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let authority_host = intercepted
-            .sni_hostname
-            .clone()
-            .unwrap_or_else(|| intercepted.original_dest.ip().to_string());
-        let authority = format!("{}:{}", authority_host, intercepted.original_dest.port());
+        let authority = match intercepted.sni_hostname.as_deref() {
+            Some(host) => format_authority(host, intercepted.original_dest.port()),
+            None => socket_authority(intercepted.original_dest),
+        };
         debug!("HTTP proxy CONNECT to {}", authority);
         let connect_request = format!(
             "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n",
@@ -534,6 +533,34 @@ mod tests {
         .await
         .expect("timed out");
         assert!(res.is_ok(), "CONNECT negotiation should succeed");
+    }
+
+    #[tokio::test]
+    async fn http_connect_brackets_ipv6_original_destination() {
+        let handler =
+            UpstreamHandler::new(1000, 5000, ErrorMitigationConfig::default(), 0).unwrap();
+        let (mut upstream, mut upstream_mock) = tokio::io::duplex(1024);
+
+        let conn = InterceptedConnection {
+            client_addr: "[::1]:12345".parse().unwrap(),
+            original_dest: "[2001:db8::10]:443".parse().unwrap(),
+            sni_hostname: None,
+        };
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = upstream_mock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains("CONNECT [2001:db8::10]:443 HTTP/1.1"));
+            assert!(req.contains("Host: [2001:db8::10]:443\r\n"));
+            upstream_mock
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let result = handler.http_connect_impl(&conn, &mut upstream).await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

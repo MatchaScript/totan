@@ -63,9 +63,12 @@ use aya_ebpf::{
 use core::mem;
 use network_types::{
     eth::{EthHdr, EtherType},
-    ip::{IpProto, Ipv4Hdr},
+    ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
     tcp::TcpHdr,
 };
+
+const AF_INET: u32 = 2;
+const AF_INET6: u32 = 10;
 
 /// Layout-compatible mirror of the userspace `TproxyConfig` in
 /// `totan/src/ebpf.rs`. Both sides must be updated together.
@@ -74,6 +77,8 @@ use network_types::{
 pub struct TproxyConfig {
     /// Listener IPv4 address in network byte order (127.0.0.1 → 0x0100007F).
     pub tproxy_ipv4_be: u32,
+    /// Listener IPv6 address as four network-byte-order u32 words.
+    pub tproxy_ipv6_be: [u32; 4],
     /// Listener TCP port in network byte order.
     pub tproxy_port_be: u16,
     pub _pad0: u16,
@@ -94,6 +99,8 @@ static TOTAN_CONFIG: Array<TproxyConfig> = Array::<TproxyConfig>::with_max_entri
 pub struct HostHookConfig {
     /// Redirect target IPv4 in network byte order (typically 127.0.0.1 → 0x0100007F).
     pub redirect_ipv4_be: u32,
+    /// Redirect target IPv6 as four network-byte-order u32 words (`::1`).
+    pub redirect_ipv6_be: [u32; 4],
     /// Redirect target TCP port in network byte order.
     pub redirect_port_be: u16,
     pub _pad: u16,
@@ -110,9 +117,22 @@ static TOTAN_HOST_CFG: Array<HostHookConfig> = Array::<HostHookConfig>::with_max
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct OrigDst {
-    /// Original destination IPv4 in network byte order.
-    pub addr_be: u32,
+    /// Linux address family (`AF_INET` or `AF_INET6`).
+    pub family: u32,
+    /// Network-byte-order address words. IPv4 uses only index zero.
+    pub addr_be: [u32; 4],
     /// Original destination port in network byte order.
+    pub port_be: u16,
+    pub _pad: u16,
+}
+
+/// Correlates an accepted localhost connection with its original destination.
+/// IPv4 and IPv6 have independent ephemeral-port spaces, so family is part of
+/// the key to prevent cross-family collisions.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SportKey {
+    pub family: u32,
     pub port_be: u16,
     pub _pad: u16,
 }
@@ -130,8 +150,8 @@ static TOTAN_OD_BY_COOKIE: LruHashMap<u64, OrigDst> =
 /// from the accepted localhost connection, converts it to network byte
 /// order, and looks it up here.
 #[map(name = "TOTAN_OD_BY_SPORT")]
-static TOTAN_OD_BY_SPORT: LruHashMap<u16, OrigDst> =
-    LruHashMap::<u16, OrigDst>::with_max_entries(65536, 0);
+static TOTAN_OD_BY_SPORT: LruHashMap<SportKey, OrigDst> =
+    LruHashMap::<SportKey, OrigDst>::with_max_entries(65536, 0);
 
 /// `BPF_F_CURRENT_NETNS` (-1L cast to u64): look up socket in the current netns.
 const BPF_F_CURRENT_NETNS: u64 = u64::MAX;
@@ -157,10 +177,18 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
     // Copy out the packed field before comparing — taking &eth.ether_type
     // on a #[repr(C, packed)] struct is UB under rustc ≥ 1.94 (E0793).
     let ether_type = eth.ether_type;
-    if ether_type != EtherType::Ipv4.into() {
-        return Ok(TC_ACT_OK as i32);
+    if ether_type == EtherType::Ipv4.into() {
+        return try_ingress_v4(ctx);
+    }
+    if ether_type == EtherType::Ipv6.into() {
+        return try_ingress_v6(ctx);
     }
 
+    Ok(TC_ACT_OK as i32)
+}
+
+#[inline(always)]
+fn try_ingress_v4(ctx: &TcContext) -> Result<i32, ()> {
     let ipv4: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
     if ipv4.proto != IpProto::Tcp.into() {
         return Ok(TC_ACT_OK as i32);
@@ -189,11 +217,6 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
     let raw_skb: *mut aya_ebpf::bindings::__sk_buff = ctx.skb.skb;
     let skb: *mut core::ffi::c_void = raw_skb as *mut _;
 
-    // Tag every matching packet so the fwmark policy rule routes it to
-    // `local 0.0.0.0/0 dev lo` — otherwise the kernel tries to forward
-    // packets addressed to the external dst and drops them.
-    unsafe { (*raw_skb).mark = cfg.fwmark };
-
     // Only hijack the initial SYN via sk_assign(listener). Once the SYN is
     // assigned, the kernel creates a reqsk in its ehash keyed on the full
     // 4-tuple; subsequent packets (ACK / data / FIN) are found by the
@@ -205,6 +228,7 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
     // tcp_rcv_state_process() in TCP_LISTEN state, which treats "ACK without
     // SYN" as invalid and triggers a RST, blowing up the connection.
     if tcp.syn() == 0 || tcp.ack() != 0 {
+        unsafe { (*raw_skb).mark = cfg.fwmark };
         return Ok(TC_ACT_OK as i32);
     }
 
@@ -231,8 +255,96 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK as i32);
     }
 
-    let _ = unsafe { bpf_sk_assign(skb, sk as *mut _, 0) };
+    let assigned = unsafe { bpf_sk_assign(skb, sk as *mut _, 0) };
     unsafe { bpf_sk_release(sk as *mut _) };
+    if assigned == 0 {
+        unsafe { (*raw_skb).mark = cfg.fwmark };
+    }
+
+    Ok(TC_ACT_OK as i32)
+}
+
+/// Return the TCP header offset for an IPv6 packet. At most four extension
+/// headers are followed, matching Cilium's verifier-bounded limit. Fragmented
+/// packets are passed through because non-initial fragments do not carry TCP
+/// ports and assigning only a subset of a fragmented flow would be unsafe.
+#[inline(always)]
+fn ipv6_tcp_offset(ctx: &TcContext, mut next_header: u8) -> Result<Option<usize>, ()> {
+    const HOP_BY_HOP: u8 = 0;
+    const TCP: u8 = 6;
+    const ROUTING: u8 = 43;
+    const FRAGMENT: u8 = 44;
+    const AUTH: u8 = 51;
+    const NO_NEXT_HEADER: u8 = 59;
+    const DEST_OPTIONS: u8 = 60;
+
+    let mut offset = EthHdr::LEN + Ipv6Hdr::LEN;
+    for _ in 0..4 {
+        match next_header {
+            TCP => return Ok(Some(offset)),
+            FRAGMENT | NO_NEXT_HEADER => return Ok(None),
+            HOP_BY_HOP | ROUTING | DEST_OPTIONS | AUTH => {
+                let current_header = next_header;
+                let header: [u8; 2] = ctx.load(offset).map_err(|_| ())?;
+                next_header = header[0];
+                let length = if current_header == AUTH {
+                    (header[1] as usize + 2) * 4
+                } else {
+                    (header[1] as usize + 1) * 8
+                };
+                offset += length;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+#[inline(always)]
+fn try_ingress_v6(ctx: &TcContext) -> Result<i32, ()> {
+    let ipv6: Ipv6Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
+    let Some(tcp_offset) = ipv6_tcp_offset(ctx, ipv6.next_hdr)? else {
+        return Ok(TC_ACT_OK as i32);
+    };
+    let tcp: TcpHdr = ctx.load(tcp_offset).map_err(|_| ())?;
+    let dst_port = u16::from_be_bytes(tcp.dest);
+    if dst_port != 80 && dst_port != 443 {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    let cfg = TOTAN_CONFIG.get(0).ok_or(())?;
+    let raw_skb: *mut aya_ebpf::bindings::__sk_buff = ctx.skb.skb;
+    let skb: *mut core::ffi::c_void = raw_skb as *mut _;
+    if tcp.syn() == 0 || tcp.ack() != 0 {
+        unsafe { (*raw_skb).mark = cfg.fwmark };
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
+    tuple.__bindgen_anon_1.ipv6.saddr = [0; 4];
+    tuple.__bindgen_anon_1.ipv6.sport = 0;
+    tuple.__bindgen_anon_1.ipv6.daddr = cfg.tproxy_ipv6_be;
+    tuple.__bindgen_anon_1.ipv6.dport = cfg.tproxy_port_be;
+    let tuple_size = mem::size_of_val(unsafe { &tuple.__bindgen_anon_1.ipv6 }) as u32;
+
+    let sk = unsafe {
+        bpf_skc_lookup_tcp(
+            skb,
+            &mut tuple as *mut bpf_sock_tuple,
+            tuple_size,
+            BPF_F_CURRENT_NETNS,
+            0,
+        )
+    };
+    if sk.is_null() {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    let assigned = unsafe { bpf_sk_assign(skb, sk as *mut _, 0) };
+    unsafe { bpf_sk_release(sk as *mut _) };
+    if assigned == 0 {
+        unsafe { (*raw_skb).mark = cfg.fwmark };
+    }
 
     Ok(TC_ACT_OK as i32)
 }
@@ -289,18 +401,76 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, ()> {
     }
 
     let orig = OrigDst {
-        addr_be: sa.user_ip4,
+        family: AF_INET,
+        addr_be: [sa.user_ip4, 0, 0, 0],
         port_be: dst_port_be,
         _pad: 0,
     };
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) };
 
-    // Best-effort insert; the LRU evicts on pressure so insert never fails
-    // for capacity reasons, only for verifier/permission errors.
-    let _ = TOTAN_OD_BY_COOKIE.insert(&cookie, &orig, 0);
+    // Do not redirect if metadata preservation failed. A fail-open connection
+    // is preferable to accepting it locally without a recoverable destination.
+    if TOTAN_OD_BY_COOKIE.insert(&cookie, &orig, 0).is_err() {
+        return Ok(1);
+    }
 
     // Rewrite destination to the local listener.
     sa.user_ip4 = cfg.redirect_ipv4_be;
+    sa.user_port = u32::from(cfg.redirect_port_be);
+
+    Ok(1)
+}
+
+/// IPv6 counterpart to `totan_connect4`. It preserves the 128-bit original
+/// destination and redirects the connection to `[::1]:redirect_port`.
+#[cgroup_sock_addr(connect6)]
+pub fn totan_connect6(ctx: SockAddrContext) -> i32 {
+    try_connect6(&ctx).unwrap_or(1)
+}
+
+#[inline(always)]
+fn try_connect6(ctx: &SockAddrContext) -> Result<i32, ()> {
+    let sa = unsafe { &mut *ctx.sock_addr };
+    if sa.type_ != SOCK_STREAM || sa.protocol != IPPROTO_TCP {
+        return Ok(1);
+    }
+
+    let raw_user_port: u32 = unsafe { core::ptr::read_volatile(&sa.user_port as *const u32) };
+    let dst_port_be = raw_user_port as u16;
+    let dst_port_host = u16::from_be(dst_port_be);
+    if dst_port_host != 80 && dst_port_host != 443 {
+        return Ok(1);
+    }
+
+    let cfg = TOTAN_HOST_CFG.get(0).ok_or(())?;
+    let sk = unsafe { sa.__bindgen_anon_1.sk };
+    if !sk.is_null() && cfg.self_mark != 0 && unsafe { (*sk).mark } == cfg.self_mark {
+        return Ok(1);
+    }
+
+    let orig = OrigDst {
+        family: AF_INET6,
+        // Spell out every word so LLVM emits fixed context offsets. A whole
+        // array copy is lowered through a derived pointer, which the
+        // BPF_PROG_TYPE_CGROUP_SOCK_ADDR verifier rejects.
+        addr_be: [
+            sa.user_ip6[0],
+            sa.user_ip6[1],
+            sa.user_ip6[2],
+            sa.user_ip6[3],
+        ],
+        port_be: dst_port_be,
+        _pad: 0,
+    };
+    let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) };
+    if TOTAN_OD_BY_COOKIE.insert(&cookie, &orig, 0).is_err() {
+        return Ok(1);
+    }
+
+    sa.user_ip6[0] = cfg.redirect_ipv6_be[0];
+    sa.user_ip6[1] = cfg.redirect_ipv6_be[1];
+    sa.user_ip6[2] = cfg.redirect_ipv6_be[2];
+    sa.user_ip6[3] = cfg.redirect_ipv6_be[3];
     sa.user_port = u32::from(cfg.redirect_port_be);
 
     Ok(1)
@@ -329,9 +499,14 @@ fn try_sockops(ctx: &SockOpsContext) -> Result<(), ()> {
     };
     // local_port is host byte order; map key is network byte order to match
     // what userspace gets from `peer_addr.port().to_be()`.
-    let sport_be: u16 = (ctx.local_port() as u16).to_be();
-    let _ = TOTAN_OD_BY_SPORT.insert(&sport_be, &orig, 0);
-    let _ = TOTAN_OD_BY_COOKIE.remove(&cookie);
+    let key = SportKey {
+        family: orig.family,
+        port_be: (ctx.local_port() as u16).to_be(),
+        _pad: 0,
+    };
+    if TOTAN_OD_BY_SPORT.insert(&key, &orig, 0).is_ok() {
+        let _ = TOTAN_OD_BY_COOKIE.remove(&cookie);
+    }
     Ok(())
 }
 

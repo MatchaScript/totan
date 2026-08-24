@@ -73,32 +73,33 @@ pub struct EbpfConfig {
     pub ingress_interfaces: Vec<String>,
 
     /// Localhost TPROXY listener port. The tc ingress program assigns matching
-    /// flows to the listener at `127.0.0.1:<tproxy_port>` via `bpf_sk_assign`.
+    /// flows to family-matched listeners on `127.0.0.1` and `::1` via
+    /// `bpf_sk_assign`.
     /// Defaults to the top-level `listen_port` when unset.
     #[serde(default)]
     pub tproxy_port: Option<u16>,
 
     /// fwmark placed on packets after `bpf_sk_assign` so the kernel's policy
     /// routing delivers them locally instead of forwarding. The loader
-    /// automatically installs `ip rule fwmark <N> lookup 100` and
-    /// `ip route local 0.0.0.0/0 dev lo table 100` at startup.
+    /// automatically installs IPv4/IPv6 fwmark rules and local routes in
+    /// routing table 100 at startup.
     /// Must not overlap with Cilium's mark range (0x0200–0x0E00).
     /// Default: 0x7474.
     #[serde(default = "default_fwmark")]
     pub fwmark: u32,
 
     /// Optional host-process interception via cgroup BPF hooks
-    /// (`cgroup/connect4` + `sockops`). Disabled when absent.
+    /// (`cgroup/connect4` + `cgroup/connect6` + `sockops`). Disabled when absent.
     /// See `HostHooksConfig` for details.
     #[serde(default)]
     pub host_hooks: Option<HostHooksConfig>,
 }
 
 /// Cgroup-based host egress interception. When present, totan loads
-/// `cgroup/connect4` + `sockops` BPF programs and attaches them to the
+/// `cgroup/connect4` + `cgroup/connect6` + `sockops` BPF programs and attaches them to the
 /// listed cgroup paths. Connections from processes inside those cgroups
 /// (and their descendants) targeting TCP/80 or TCP/443 are redirected
-/// to `127.0.0.1:<redirect_port>`, where a plain TCP listener accepts
+/// to family-matched loopback listeners, where a plain TCP listener accepts
 /// them and recovers the original destination via a BPF map.
 ///
 /// Pod traffic is **not** affected by this — pod processes live under
