@@ -57,17 +57,22 @@ jobs:
       - name: Install nightly-2026-03-01 for the eBPF crate
         run: rustup toolchain install nightly-2026-03-01 --component rust-src --no-self-update
 
-      # bpf-linker takes ~5 min to build from source; cache the installed bin.
+      # Use the official static binary. Building bpf-linker from source binds
+      # CI to the runner's system LLVM version (v0.11 requires LLVM 23).
       - name: Cache bpf-linker
         id: cache-bpf-linker
         uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/bpf-linker
-          key: bpf-linker-${{ runner.os }}-v1
+          key: bpf-linker-${{ runner.os }}-x86_64-v0.11.0
 
       - name: Install bpf-linker
         if: steps.cache-bpf-linker.outputs.cache-hit != 'true'
-        run: cargo install bpf-linker --locked
+        run: |
+          curl -fsSL -o /tmp/bpf-linker.tar.zst \
+            https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          tar -xpf /tmp/bpf-linker.tar.zst -C ~/.cargo/bin
+          bpf-linker --version
 
       - uses: Swatinem/rust-cache@v2
 
