@@ -57,7 +57,7 @@ cleanup() {
     wait 2>/dev/null
 
     if [[ "$MODE" == "netfilter" ]]; then
-        nft delete table ip totan_stress 2>/dev/null
+        nft delete table inet totan_stress 2>/dev/null
     else
         ip rule del fwmark 0x7474 lookup 100 2>/dev/null
         ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
@@ -118,9 +118,9 @@ if [[ "$MODE" == "netfilter" ]]; then
         useradd -u "$TEST_UID" -M -s /bin/bash "$TEST_USER" 2>/dev/null \
             || useradd -u "$TEST_UID" -M "$TEST_USER"
     fi
-    nft add table ip totan_stress
-    nft add chain ip totan_stress output '{ type nat hook output priority -100; policy accept; }'
-    nft add rule ip totan_stress output "meta skuid $TEST_UID tcp dport { 80 } redirect to :3129"
+    nft add table inet totan_stress
+    nft add chain inet totan_stress output '{ type nat hook output priority -100; policy accept; }'
+    nft add rule inet totan_stress output "meta skuid $TEST_UID tcp dport { 80 } redirect to :3129"
     AB_PREFIX=(sudo -u "$TEST_USER" --preserve-env=PATH)
 
 else  # ebpf

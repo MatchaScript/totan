@@ -290,7 +290,8 @@ impl Default for TotanConfig {
 #[serde(deny_unknown_fields)]
 pub struct NetfilterConfig {
     /// When `true`, totan installs nftables OUTPUT rules that redirect all
-    /// outbound TCP traffic on `redirect_ports` to its listener. Packets marked
+    /// outbound IPv4/IPv6 TCP traffic on `redirect_ports` to family-matched
+    /// listeners. Packets marked
     /// with `fwmark` (set on totan's own upstream sockets via `SO_MARK`) are
     /// excluded to prevent redirect loops — this works regardless of the
     /// running user.

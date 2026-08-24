@@ -21,9 +21,9 @@
 #
 # Modes differ in how they intercept the client's traffic:
 #
-#   netfilter: iptables OUTPUT REDIRECT scoped to a dedicated uid. The client
-#              (curl) runs as that uid on the host netns; totan listens on
-#              127.0.0.1:3129 and reads SO_ORIGINAL_DST on accept.
+#   netfilter: totan manages an inet OUTPUT REDIRECT ruleset. The client
+#              (curl) runs on the host netns; family-specific listeners read
+#              SO_ORIGINAL_DST/IP6T_SO_ORIGINAL_DST on accept.
 #
 #   ebpf:      pod netns with veth pair. totan attaches a tcx ingress program
 #              on the host-side veth, sets up fwmark policy routing, and binds
@@ -115,7 +115,7 @@ cleanup() {
     wait 2>/dev/null
 
     if [[ "$MODE" == "netfilter" ]]; then
-        nft delete table ip totan_e2e 2>/dev/null
+        ip -6 route del local 2001:db8::/32 dev lo table local 2>/dev/null
     else
         ip rule del fwmark 0x7474 lookup 100 2>/dev/null
         ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
@@ -243,10 +243,11 @@ if [[ "$MODE" == "netfilter" ]]; then
             || useradd -u "$TEST_UID" -M "$TEST_USER"
     fi
 
-    echo "[e2e] netfilter: installing nftables redirect for uid $TEST_UID..."
-    nft add table ip totan_e2e
-    nft add chain ip totan_e2e output '{ type nat hook output priority -100; policy accept; }'
-    nft add rule ip totan_e2e output "meta skuid $TEST_UID tcp dport { 80, 443 } redirect to :3129"
+    # connect(2) requires a route before packets reach the OUTPUT hook. A local
+    # route makes the documentation prefix routable without creating a real
+    # endpoint; totan's managed inet rules then redirect both families.
+    echo "[e2e] netfilter: adding IPv6 documentation-prefix local route..."
+    ip -6 route add local 2001:db8::/32 dev lo table local
 
     CURL_PREFIX=(sudo -u "$TEST_USER" --preserve-env=PATH)
 
@@ -474,6 +475,23 @@ if [[ "$oks" != "$conc_n" ]]; then
     printf '%s\n' "$conc_out" | grep -v '^OK$' | head -3 | sed 's/^/      /' >&2
 fi
 assert_eq "concurrent: ${conc_n}/${conc_n} requests succeeded" "$conc_n" "$oks"
+
+# ─── netfilter-only: IPv6 original-destination recovery ──────────────────────
+if [[ "$MODE" == "netfilter" ]]; then
+    echo
+    echo "── scenario N6-1: netfilter IPv6 HTTP → forward proxy ────────────────"
+    body=$(run_curl --resolve 'v6-plain.test:80:[2001:db8::10]' 'http://v6-plain.test/')
+    assert_log_contains "$PROXY_DEFAULT_LOG" "GET http://v6-plain.test/" "netfilter-ipv6-http: proxy got absolute URI"
+    assert_log_contains "$BACKEND_HTTP_LOG"  "GET / host=v6-plain.test"  "netfilter-ipv6-http: backend got Host"
+    assert_eq           "netfilter-ipv6-http: body round-trip" "backend:backend-http" "$body"
+
+    echo
+    echo "── scenario N6-2: netfilter IPv6 HTTPS → CONNECT ─────────────────────"
+    body=$(run_curl --resolve 'v6-secure.test:443:[2001:db8::11]' 'https://v6-secure.test/')
+    assert_log_contains "$PROXY_DEFAULT_LOG" "CONNECT v6-secure.test:443" "netfilter-ipv6-https: proxy saw CONNECT"
+    assert_log_contains "$BACKEND_TLS_LOG"   "GET / host=v6-secure.test"  "netfilter-ipv6-https: backend got request"
+    assert_eq           "netfilter-ipv6-https: body round-trip" "backend:backend-tls" "$body"
+fi
 
 # ─── ebpf-only: host-originated scenarios via cgroup hooks ───────────────────
 # Skipped under netfilter mode (the netfilter rules redirect by uid, not by

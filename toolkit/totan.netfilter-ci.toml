@@ -1,6 +1,6 @@
 # totan configuration for the netfilter e2e CI test.
-# toolkit/e2e/run.sh netfilter creates the iptables REDIRECT rule and spawns
-# three mock proxies (8880/8881/8882) before starting totan with this config.
+# totan installs its managed dual-stack nftables rules while toolkit/e2e/run.sh
+# supplies reachable documentation-prefix routes and mock upstream services.
 
 listen_port = 3129
 
@@ -12,6 +12,10 @@ default_proxy = "http://127.0.0.1:8880"
 pac_file = "__PAC_PATH__"
 
 interception_mode = "netfilter"
+
+[netfilter]
+manage_rules = true
+redirect_ports = [80, 443]
 
 [logging]
 level = "debug"

@@ -33,17 +33,36 @@ impl PacketInterceptor {
             &self.config.netfilter,
         )?;
 
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", self.config.listen_port)).await?;
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+        let listener_v4 = bind_listener(
+            SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::UNSPECIFIED,
+                self.config.listen_port,
+            )),
+            false,
+        )?;
+        let listener_v6 = bind_listener(
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::UNSPECIFIED,
+                self.config.listen_port,
+                0,
+                0,
+            )),
+            false,
+        )?;
         info!(
-            "Netfilter interceptor listening on port {}",
-            self.config.listen_port
+            "Netfilter interceptor listening on 0.0.0.0:{} and [::]:{}",
+            self.config.listen_port, self.config.listen_port
         );
 
         let limiter = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
-        accept_loop(
-            listener,
+        run_accept_loops(
+            vec![
+                (listener_v4, OriginalDstSource::SoOriginalDst),
+                (listener_v6, OriginalDstSource::SoOriginalDst),
+            ],
             connection_manager,
-            OriginalDstSource::SoOriginalDst,
             limiter,
         )
         .await
@@ -120,14 +139,15 @@ fn resolve_ebpf_plan(interfaces_configured: bool, host_configured: bool) -> Resu
 /// attaches the rest as they appear). The returned `Loader` must outlive the
 /// accept loop so RAII detaches the program on shutdown.
 #[cfg(feature = "ebpf")]
-fn setup_tc(
-    config: &TotanConfig,
-) -> Result<(
+type TcSetup = (
     Vec<(TcpListener, OriginalDstSource)>,
     crate::ebpf::Loader,
     Vec<String>,
     Vec<String>,
-)> {
+);
+
+#[cfg(feature = "ebpf")]
+fn setup_tc(config: &TotanConfig) -> Result<TcSetup> {
     use crate::ebpf::{resolve_interfaces, Loader};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
@@ -240,7 +260,6 @@ enum OriginalDstSource {
     CgroupSportMap(crate::cgroup::SportMap),
 }
 
-#[cfg(feature = "ebpf")]
 async fn run_accept_loops(
     listeners: Vec<(TcpListener, OriginalDstSource)>,
     connection_manager: Arc<ConnectionManager>,
@@ -349,19 +368,10 @@ async fn resolve_original_dest(
 fn so_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
     #[cfg(target_os = "linux")]
     {
-        use nix::sys::socket::{getsockopt, sockopt::OriginalDst};
-        use std::net::SocketAddrV4;
-        use std::os::fd::BorrowedFd;
-        use std::os::unix::io::AsRawFd;
-
-        let fd = stream.as_raw_fd();
-        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        let orig_dst = getsockopt(&borrowed_fd, OriginalDst)?;
-        let addr = SocketAddrV4::new(
-            std::net::Ipv4Addr::from(orig_dst.sin_addr.s_addr.to_be()),
-            orig_dst.sin_port.to_be(),
-        );
-        Ok(SocketAddr::V4(addr))
+        match stream.peer_addr()? {
+            SocketAddr::V4(_) => so_original_dst_v4(stream),
+            SocketAddr::V6(_) => so_original_dst_v6(stream),
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -370,6 +380,59 @@ fn so_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
             .peer_addr()
             .map_err(|e| anyhow::anyhow!("Cannot get original destination: {}", e))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn so_original_dst_v4(stream: &TcpStream) -> Result<SocketAddr> {
+    use nix::sys::socket::{getsockopt, sockopt::OriginalDst};
+    use std::net::SocketAddrV4;
+    use std::os::fd::{AsRawFd, BorrowedFd};
+
+    let borrowed_fd = unsafe { BorrowedFd::borrow_raw(stream.as_raw_fd()) };
+    let orig_dst = getsockopt(&borrowed_fd, OriginalDst)?;
+    Ok(SocketAddr::V4(SocketAddrV4::new(
+        std::net::Ipv4Addr::from(orig_dst.sin_addr.s_addr.to_be()),
+        u16::from_be(orig_dst.sin_port),
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn so_original_dst_v6(stream: &TcpStream) -> Result<SocketAddr> {
+    use nix::libc;
+    use std::os::fd::AsRawFd;
+
+    // Linux exposes the IPv6 original destination through netfilter's
+    // IP6T_SO_ORIGINAL_DST option (same numeric option as IPv4, different
+    // protocol level). libc does not currently publish the named constant.
+    const IP6T_SO_ORIGINAL_DST: libc::c_int = 80;
+
+    let mut raw = unsafe { std::mem::zeroed::<libc::sockaddr_in6>() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            IP6T_SO_ORIGINAL_DST,
+            &mut raw as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if raw.sin6_family as libc::c_int != libc::AF_INET6 {
+        anyhow::bail!(
+            "IP6T_SO_ORIGINAL_DST returned unexpected address family {}",
+            raw.sin6_family
+        );
+    }
+
+    Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+        std::net::Ipv6Addr::from(raw.sin6_addr.s6_addr),
+        u16::from_be(raw.sin6_port),
+        u32::from_be(raw.sin6_flowinfo),
+        raw.sin6_scope_id,
+    )))
 }
 
 /// Poll `/sys/class/net` every 5 seconds for interfaces that match `patterns`
@@ -401,7 +464,6 @@ async fn watch_new_interfaces(
 
 /// Build a family-specific listener. IPv6 sockets are forced to v6-only so
 /// IPv4 and IPv6 can bind the same port without platform-default ambiguity.
-#[cfg(feature = "ebpf")]
 fn bind_listener(addr: SocketAddr, transparent: bool) -> Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -414,8 +476,13 @@ fn bind_listener(addr: SocketAddr, transparent: bool) -> Result<TcpListener> {
         sock.set_only_v6(true)?;
     }
     if transparent {
-        set_ip_transparent(&sock, ipv6)?;
-        set_ip_freebind(&sock, ipv6)?;
+        #[cfg(feature = "ebpf")]
+        {
+            set_ip_transparent(&sock, ipv6)?;
+            set_ip_freebind(&sock, ipv6)?;
+        }
+        #[cfg(not(feature = "ebpf"))]
+        anyhow::bail!("transparent listener requested without the ebpf feature");
     }
 
     sock.bind(&addr.into())?;
@@ -500,8 +567,7 @@ fn set_ip_freebind(sock: &socket2::Socket, ipv6: bool) -> Result<()> {
 
 #[cfg(all(test, feature = "ebpf"))]
 mod plan_tests {
-    use super::{bind_listener, resolve_ebpf_plan, EbpfPlan};
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    use super::{resolve_ebpf_plan, EbpfPlan};
 
     #[test]
     fn tc_and_host() {
@@ -536,6 +602,17 @@ mod plan_tests {
         );
     }
 
+    #[test]
+    fn neither_is_error() {
+        assert!(resolve_ebpf_plan(false, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::bind_listener;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
     #[tokio::test]
     async fn ipv4_and_ipv6_listeners_can_share_a_port() {
         let ipv4 = bind_listener(
@@ -552,10 +629,5 @@ mod plan_tests {
 
         assert_eq!(ipv4.local_addr().unwrap().port(), port);
         assert_eq!(ipv6.local_addr().unwrap().port(), port);
-    }
-
-    #[test]
-    fn neither_is_error() {
-        assert!(resolve_ebpf_plan(false, false).is_err());
     }
 }
