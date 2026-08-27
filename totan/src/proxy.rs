@@ -17,6 +17,8 @@ pub enum ProxyParseError {
     EmptyHost(String),
     #[error("unknown directive '{0}', expected DIRECT, PROXY, HTTP, SOCKS, or SOCKS5")]
     UnknownDirective(String),
+    #[error("unsupported proxy directive '{0}'")]
+    UnsupportedDirective(String),
     #[error("empty proxy list")]
     Empty,
 }
@@ -140,15 +142,12 @@ impl FromStr for ProxyOrDirect {
         let (kw, rest) = trimmed
             .split_once(|c: char| c.is_ascii_whitespace())
             .ok_or_else(|| ProxyParseError::UnknownDirective(trimmed.to_string()))?;
-        let endpoint: HostAndPort = rest.trim().parse()?;
         let kw_upper = kw.to_ascii_uppercase();
         match kw_upper.as_str() {
             // `PROXY` and `HTTP` are interchangeable aliases for an HTTP proxy.
-            "PROXY" | "HTTP" => Ok(Self::Proxy(Proxy::Http(endpoint))),
-            // HTTPS (TLS to the proxy itself) isn't implemented yet — fall back
-            // to plain HTTP semantics. Swap for a dedicated variant when added.
-            "HTTPS" => Ok(Self::Proxy(Proxy::Http(endpoint))),
-            "SOCKS" | "SOCKS5" => Ok(Self::Proxy(Proxy::Socks5(endpoint))),
+            "PROXY" | "HTTP" => Ok(Self::Proxy(Proxy::Http(rest.trim().parse()?))),
+            "SOCKS" | "SOCKS5" => Ok(Self::Proxy(Proxy::Socks5(rest.trim().parse()?))),
+            "HTTPS" => Err(ProxyParseError::UnsupportedDirective(kw.to_string())),
             _ => Err(ProxyParseError::UnknownDirective(kw.to_string())),
         }
     }
@@ -225,12 +224,14 @@ impl FromStr for Proxies {
     /// take down the whole chain — mirrors browser behaviour). An empty
     /// post-filter list is an error.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let entries: Vec<ProxyOrDirect> = s
-            .split(';')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse::<ProxyOrDirect>().ok())
-            .collect();
+        let mut entries = Vec::new();
+        for entry in s.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            match entry.parse::<ProxyOrDirect>() {
+                Ok(entry) => entries.push(entry),
+                Err(error @ ProxyParseError::UnsupportedDirective(_)) => return Err(error),
+                Err(_) => {} // PAC lists tolerate malformed/unknown alternatives.
+            }
+        }
         if entries.is_empty() {
             Err(ProxyParseError::Empty)
         } else {
@@ -249,14 +250,14 @@ pub fn proxies_from_url_str(url_str: &str) -> Result<Proxies, ProxyParseError> {
         .ok_or_else(|| ProxyParseError::EmptyHost(url_str.to_string()))?;
     let scheme = url.scheme();
     let default_port = match scheme {
-        "http" | "https" => 80,
+        "http" => 80,
         "socks5" | "socks" => 1080,
         _ => return Err(ProxyParseError::UnknownDirective(scheme.to_string())),
     };
     let port = url.port().unwrap_or(default_port);
     let endpoint = HostAndPort::new(host, port);
     let proxy = match scheme {
-        "http" | "https" => Proxy::Http(endpoint),
+        "http" => Proxy::Http(endpoint),
         "socks5" | "socks" => Proxy::Socks5(endpoint),
         _ => return Err(ProxyParseError::UnknownDirective(scheme.to_string())),
     };
@@ -362,5 +363,14 @@ mod tests {
             p.first(),
             &ProxyOrDirect::Proxy(Proxy::Socks5("127.0.0.1:1080".parse().unwrap()))
         );
+    }
+
+    #[test]
+    fn encrypted_http_proxy_is_rejected_until_supported() {
+        assert!(proxies_from_url_str("https://proxy.example:443").is_err());
+        assert!("HTTPS proxy.example:443".parse::<Proxies>().is_err());
+        assert!("HTTPS proxy.example:443; DIRECT"
+            .parse::<Proxies>()
+            .is_err());
     }
 }

@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -29,6 +30,8 @@ jobs:
       - name: Install bpf-linker
         if: steps.cache-bpf-linker.outputs.cache-hit != 'true'
         run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
           curl -fsSL -o /tmp/bpf-linker.tar.zst \
             https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst
           tar -xpf /tmp/bpf-linker.tar.zst -C ~/.cargo/bin
@@ -38,13 +41,13 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Check
-        run: cargo check --workspace --exclude totan-ebpf
+        run: cargo check --locked --workspace --exclude totan-ebpf
       - name: Clippy
-        run: cargo clippy --workspace --exclude totan-ebpf --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --exclude totan-ebpf --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace --exclude totan-ebpf
+        run: cargo test --locked --workspace --exclude totan-ebpf
       - name: Build release binary
-        run: cargo build -p totan --release
+        run: cargo build --locked -p totan --release
 
       - uses: actions/upload-artifact@v5
         with:

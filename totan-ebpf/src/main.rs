@@ -54,7 +54,7 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{bpf_sock_tuple, TC_ACT_OK},
+    bindings::{bpf_sock_tuple, BPF_TCP_LISTEN, BPF_TCP_TIME_WAIT, TC_ACT_OK},
     helpers::gen::{bpf_get_socket_cookie, bpf_sk_assign, bpf_sk_release, bpf_skc_lookup_tcp},
     macros::{cgroup_sock_addr, classifier, map, sock_ops},
     maps::{Array, LruHashMap},
@@ -217,18 +217,37 @@ fn try_ingress_v4(ctx: &TcContext) -> Result<i32, ()> {
     let raw_skb: *mut aya_ebpf::bindings::__sk_buff = ctx.skb.skb;
     let skb: *mut core::ffi::c_void = raw_skb as *mut _;
 
-    // Only hijack the initial SYN via sk_assign(listener). Once the SYN is
-    // assigned, the kernel creates a reqsk in its ehash keyed on the full
-    // 4-tuple; subsequent packets (ACK / data / FIN) are found by the
-    // standard ehash lookup — first as TCP_NEW_SYN_RECV, then as the child
-    // TCP_ESTABLISHED socket — as long as they carry the fwmark that keeps
-    // them on the local-delivery path.
-    //
-    // Forcing sk_assign(listener) on a pure ACK would hand the packet to
-    // tcp_rcv_state_process() in TCP_LISTEN state, which treats "ACK without
-    // SYN" as invalid and triggers a RST, blowing up the connection.
+    // Cilium's established proxy path re-looks up the transparent child
+    // socket by the packet's full tuple and assigns that socket again. This
+    // distinguishes our intercepted flows from connections that pre-date a
+    // dynamic tc attach: the latter have no matching socket in the host netns.
     if tcp.syn() == 0 || tcp.ack() != 0 {
-        unsafe { (*raw_skb).mark = cfg.fwmark };
+        let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
+        tuple.__bindgen_anon_1.ipv4.saddr = u32::from_ne_bytes(ipv4.src_addr);
+        tuple.__bindgen_anon_1.ipv4.daddr = u32::from_ne_bytes(ipv4.dst_addr);
+        tuple.__bindgen_anon_1.ipv4.sport = u16::from_ne_bytes(tcp.source);
+        tuple.__bindgen_anon_1.ipv4.dport = u16::from_ne_bytes(tcp.dest);
+        let tuple_size = mem::size_of_val(unsafe { &tuple.__bindgen_anon_1.ipv4 }) as u32;
+        let sk = unsafe {
+            bpf_skc_lookup_tcp(
+                skb,
+                &mut tuple as *mut bpf_sock_tuple,
+                tuple_size,
+                BPF_F_CURRENT_NETNS,
+                0,
+            )
+        };
+        if sk.is_null() {
+            return Ok(TC_ACT_OK as i32);
+        }
+        let state = unsafe { (*sk).state };
+        if state != BPF_TCP_LISTEN && state != BPF_TCP_TIME_WAIT {
+            let assigned = unsafe { bpf_sk_assign(skb, sk as *mut _, 0) };
+            if assigned == 0 {
+                unsafe { (*raw_skb).mark = cfg.fwmark };
+            }
+        }
+        unsafe { bpf_sk_release(sk as *mut _) };
         return Ok(TC_ACT_OK as i32);
     }
 
@@ -254,7 +273,6 @@ fn try_ingress_v4(ctx: &TcContext) -> Result<i32, ()> {
     if sk.is_null() {
         return Ok(TC_ACT_OK as i32);
     }
-
     let assigned = unsafe { bpf_sk_assign(skb, sk as *mut _, 0) };
     unsafe { bpf_sk_release(sk as *mut _) };
     if assigned == 0 {
@@ -316,7 +334,82 @@ fn try_ingress_v6(ctx: &TcContext) -> Result<i32, ()> {
     let raw_skb: *mut aya_ebpf::bindings::__sk_buff = ctx.skb.skb;
     let skb: *mut core::ffi::c_void = raw_skb as *mut _;
     if tcp.syn() == 0 || tcp.ack() != 0 {
-        unsafe { (*raw_skb).mark = cfg.fwmark };
+        let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
+        tuple.__bindgen_anon_1.ipv6.saddr = [
+            u32::from_ne_bytes([
+                ipv6.src_addr[0],
+                ipv6.src_addr[1],
+                ipv6.src_addr[2],
+                ipv6.src_addr[3],
+            ]),
+            u32::from_ne_bytes([
+                ipv6.src_addr[4],
+                ipv6.src_addr[5],
+                ipv6.src_addr[6],
+                ipv6.src_addr[7],
+            ]),
+            u32::from_ne_bytes([
+                ipv6.src_addr[8],
+                ipv6.src_addr[9],
+                ipv6.src_addr[10],
+                ipv6.src_addr[11],
+            ]),
+            u32::from_ne_bytes([
+                ipv6.src_addr[12],
+                ipv6.src_addr[13],
+                ipv6.src_addr[14],
+                ipv6.src_addr[15],
+            ]),
+        ];
+        tuple.__bindgen_anon_1.ipv6.daddr = [
+            u32::from_ne_bytes([
+                ipv6.dst_addr[0],
+                ipv6.dst_addr[1],
+                ipv6.dst_addr[2],
+                ipv6.dst_addr[3],
+            ]),
+            u32::from_ne_bytes([
+                ipv6.dst_addr[4],
+                ipv6.dst_addr[5],
+                ipv6.dst_addr[6],
+                ipv6.dst_addr[7],
+            ]),
+            u32::from_ne_bytes([
+                ipv6.dst_addr[8],
+                ipv6.dst_addr[9],
+                ipv6.dst_addr[10],
+                ipv6.dst_addr[11],
+            ]),
+            u32::from_ne_bytes([
+                ipv6.dst_addr[12],
+                ipv6.dst_addr[13],
+                ipv6.dst_addr[14],
+                ipv6.dst_addr[15],
+            ]),
+        ];
+        tuple.__bindgen_anon_1.ipv6.sport = u16::from_ne_bytes(tcp.source);
+        tuple.__bindgen_anon_1.ipv6.dport = u16::from_ne_bytes(tcp.dest);
+        let tuple_size = mem::size_of_val(unsafe { &tuple.__bindgen_anon_1.ipv6 }) as u32;
+        let sk = unsafe {
+            bpf_skc_lookup_tcp(
+                skb,
+                &mut tuple as *mut bpf_sock_tuple,
+                tuple_size,
+                BPF_F_CURRENT_NETNS,
+                0,
+            )
+        };
+        if sk.is_null() {
+            return Ok(TC_ACT_OK as i32);
+        }
+        let state = unsafe { (*sk).state };
+        if state != BPF_TCP_LISTEN && state != BPF_TCP_TIME_WAIT {
+            let assigned = unsafe { bpf_sk_assign(skb, sk as *mut _, 0) };
+            if assigned == 0 {
+                unsafe { (*raw_skb).mark = cfg.fwmark };
+            }
+        }
+        unsafe { bpf_sk_release(sk as *mut _) };
         return Ok(TC_ACT_OK as i32);
     }
 

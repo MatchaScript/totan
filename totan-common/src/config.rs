@@ -230,7 +230,7 @@ pub struct TimeoutConfig {
     #[serde(default = "default_handshake_ms")]
     pub handshake_ms: u64,
 
-    /// Client connection idle timeout in seconds
+    /// Client connection idle timeout in seconds (0 disables the timeout)
     #[serde(default = "default_client_idle_secs")]
     pub client_idle_secs: u64,
 }

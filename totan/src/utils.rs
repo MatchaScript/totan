@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Format a host and port as an RFC 3986 authority. IPv6 literals are
@@ -63,27 +63,23 @@ pub async fn extract_sni_hostname(stream: &mut TcpStream) -> Result<String> {
     // covers post-quantum keyshares that overflow a 4 KiB buffer.
     let mut buf = [0u8; 16384];
 
-    // Peek in a loop: the ClientHello may arrive in multiple TCP segments.
-    // Stop once we have the whole record (or as much as will fit) or give up
-    // after a few retries.
-    let n = {
-        let mut n = stream.peek(&mut buf).await?;
-        for _ in 0..8 {
-            if n < 5 {
-                n = stream.peek(&mut buf).await?;
-                continue;
-            }
+    // `peek()` does not consume the already-readable prefix, so calling it
+    // again immediately returns that same prefix instead of waiting for the
+    // next TCP segment. Poll with a short yield; the caller wraps this routine
+    // in the configured handshake deadline.
+    let n = loop {
+        let n = stream.peek(&mut buf).await?;
+        if n >= 5 {
             if buf[0] != 0x16 || buf[1] != 0x03 {
-                break; // Not TLS; let the parser produce the error.
+                break n; // Not TLS; let the parser produce the error.
             }
             let record_length = u16::from_be_bytes([buf[3], buf[4]]) as usize;
             let needed = 5 + record_length;
             if needed > buf.len() || n >= needed {
-                break; // We have it all, or it can't fully fit — parse what we have.
+                break n; // Complete, or SNI must be parsed from the bounded prefix.
             }
-            n = stream.peek(&mut buf).await?;
         }
-        n
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     };
 
     extract_sni_from_bytes(&buf[..n])
@@ -192,21 +188,19 @@ fn parse_sni_extension(data: &[u8]) -> Result<String> {
 /// the bare destination IP. Returns the hostname without any `:port` suffix.
 pub async fn extract_http_host(stream: &mut TcpStream) -> Result<String> {
     let mut buf = [0u8; 4096];
-    let mut n = stream.peek(&mut buf).await?;
-    for _ in 0..8 {
+    loop {
+        let n = stream.peek(&mut buf).await?;
         if let Some(host) = parse_http_host(&buf[..n]) {
             return Ok(host);
         }
         if n >= buf.len() {
-            break;
+            return Err(anyhow::anyhow!("HTTP header exceeds 4096 bytes"));
         }
-        let m = stream.peek(&mut buf).await?;
-        if m == n {
-            break; // no progress
+        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+            return Err(anyhow::anyhow!("no Host header in request"));
         }
-        n = m;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
-    Err(anyhow::anyhow!("no Host header in request"))
 }
 
 /// Parse the `Host` header out of (possibly partial) HTTP request bytes,
@@ -255,6 +249,70 @@ where
             }
         }
     }
+}
+
+/// Relay both directions and close the pair when neither side produces data
+/// for `idle`. A zero duration preserves the unbounded legacy behaviour.
+pub async fn tolerant_copy_bidirectional_with_idle<A, B>(
+    a: &mut A,
+    b: &mut B,
+    idle: std::time::Duration,
+) -> std::io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    if idle.is_zero() {
+        return tolerant_copy_bidirectional(a, b).await;
+    }
+
+    enum ReadEvent {
+        A(std::io::Result<usize>),
+        B(std::io::Result<usize>),
+    }
+
+    let mut a_open = true;
+    let mut b_open = true;
+    let mut a_buf = [0u8; 16 * 1024];
+    let mut b_buf = [0u8; 16 * 1024];
+
+    while a_open || b_open {
+        let event = tokio::time::timeout(idle, async {
+            tokio::select! {
+                result = a.read(&mut a_buf), if a_open => ReadEvent::A(result),
+                result = b.read(&mut b_buf), if b_open => ReadEvent::B(result),
+            }
+        })
+        .await
+        .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "connection idle timeout"))?;
+
+        match event {
+            ReadEvent::A(Ok(0)) => {
+                a_open = false;
+                let _ = tokio::time::timeout(idle, b.shutdown()).await;
+            }
+            ReadEvent::B(Ok(0)) => {
+                b_open = false;
+                let _ = tokio::time::timeout(idle, a.shutdown()).await;
+            }
+            ReadEvent::A(Ok(n)) => {
+                tokio::time::timeout(idle, b.write_all(&a_buf[..n]))
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(ErrorKind::TimedOut, "upstream write timeout")
+                    })??;
+            }
+            ReadEvent::B(Ok(n)) => {
+                tokio::time::timeout(idle, a.write_all(&b_buf[..n]))
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(ErrorKind::TimedOut, "client write timeout")
+                    })??;
+            }
+            ReadEvent::A(Err(error)) | ReadEvent::B(Err(error)) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -380,6 +438,66 @@ mod tests {
         assert_eq!(parse_http_host(req), None);
     }
 
+    #[tokio::test]
+    async fn sni_waits_for_a_later_tcp_segment() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let hello = client_hello_with_sni("split.example", 0);
+        let hello = {
+            let mut h = hello;
+            let real = (h.len() - 5) as u16;
+            h[3..5].copy_from_slice(&real.to_be_bytes());
+            h
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&hello[..20]).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            stream.write_all(&hello[20..]).await.unwrap();
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let host = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            extract_sni_hostname(&mut stream),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(host, "split.example");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_host_waits_for_a_later_tcp_segment() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            stream
+                .write_all(b"Host: split.example\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let host = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            extract_http_host(&mut stream),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(host, "split.example");
+        writer.await.unwrap();
+    }
+
     #[test]
     fn test_parse_sni_extension() {
         // google.com payload
@@ -404,5 +522,23 @@ mod tests {
         ];
         let hostname = parse_sni_extension(&data).unwrap();
         assert_eq!(hostname, "google.com");
+    }
+
+    #[tokio::test]
+    async fn bidirectional_relay_enforces_idle_timeout() {
+        let (_client, mut relay_client) = tokio::io::duplex(128);
+        let (mut relay_upstream, _server) = tokio::io::duplex(128);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tolerant_copy_bidirectional_with_idle(
+                &mut relay_client,
+                &mut relay_upstream,
+                std::time::Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("relay must enforce its own idle timeout")
+        .expect_err("idle relay must close with a timeout");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
     }
 }

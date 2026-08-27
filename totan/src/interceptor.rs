@@ -322,9 +322,14 @@ async fn watch_new_interfaces(
     loop {
         interval.tick().await;
         for iface in resolve_interfaces(patterns) {
-            if attached.insert(iface.clone()) {
-                if let Err(e) = loader.attach_interface(&iface) {
-                    tracing::warn!("Failed to attach to new interface {}: {}", iface, e);
+            if !attached.contains(&iface) {
+                match loader.attach_interface(&iface) {
+                    Ok(()) => {
+                        attached.insert(iface);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to attach to new interface {}: {}", iface, e);
+                    }
                 }
             }
         }

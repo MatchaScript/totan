@@ -49,8 +49,19 @@ format = "json"
 [timeouts]
 # Upstream connection timeout in milliseconds.
 upstream_connect_ms = 3000
-# Client connection idle timeout in seconds.
+# Client connection idle timeout in seconds (0 disables it).
 client_idle_secs = 600
+
+[mitigation]
+# Number of retries after an upstream TCP connect failure.
+retry_attempts = 2
+# Base delay for exponential retry backoff.
+retry_backoff_ms = 200
+# Reset the intercepted client connection when all configured routes fail.
+rst_on_failure = true
+# Permit a last-resort DIRECT connection when PAC evaluation or every proxy
+# connection fails. Set false for mandatory/fail-closed proxy deployments.
+try_direct_on_proxy_failure = false
 
 # ── eBPF interception settings ────────────────────────────────────────────────
 [ebpf]
