@@ -74,10 +74,9 @@ jobs:
       - name: Run eBPF e2e
         run: sudo --preserve-env=PATH bash toolkit/e2e/run.sh
 
-  stress:
-    name: Stress (eBPF)
+  connection-churn:
+    name: Connection churn (eBPF)
     runs-on: ubuntu-24.04
-    if: github.event_name == 'push'
     needs: build
     steps:
       - uses: actions/checkout@v7
@@ -91,7 +90,5 @@ jobs:
         run: |
           echo "kernel: $(uname -r)"
           uname -r | awk -F. '{exit !(($1 > 6) || ($1 == 6 && $2 >= 6))}'
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y apache2-utils
-      - name: Run eBPF stress test
+      - name: Run eBPF connection-churn test
         run: sudo --preserve-env=PATH bash toolkit/e2e/stress.sh
