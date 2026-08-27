@@ -194,8 +194,8 @@ impl Drop for Loader {
 fn ipv6_to_be_words(addr: Ipv6Addr) -> [u32; 4] {
     let octets = addr.octets();
     let mut words = [0u32; 4];
-    for (word, chunk) in words.iter_mut().zip(octets.chunks_exact(4)) {
-        *word = u32::from_be_bytes(chunk.try_into().expect("IPv6 chunks are four bytes")).to_be();
+    for (word, chunk) in words.iter_mut().zip(octets.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*chunk).to_be();
     }
     words
 }

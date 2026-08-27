@@ -31,6 +31,7 @@ pub struct ConnectionManager {
     resolver: ProxyResolver,
     upstream_handler: UpstreamHandler,
     handshake_timeout: std::time::Duration,
+    try_direct_on_proxy_failure: bool,
 }
 
 impl ConnectionManager {
@@ -62,13 +63,27 @@ impl ConnectionManager {
             config.timeouts.handshake_ms,
             config.mitigation.clone(),
             upstream_mark,
-        )?;
+        )?
+        .with_client_idle_timeout(config.timeouts.client_idle_secs);
 
         Ok(Self {
             resolver,
             upstream_handler,
             handshake_timeout: std::time::Duration::from_millis(config.timeouts.handshake_ms),
+            try_direct_on_proxy_failure: config.mitigation.try_direct_on_proxy_failure,
         })
+    }
+
+    async fn resolve_proxies(&self, target_url: &str, host: &str) -> Result<Proxies> {
+        match self.resolver.resolve(target_url, host).await {
+            Ok(proxies) => Ok(proxies),
+            Err(error) if self.try_direct_on_proxy_failure => {
+                warn!("proxy resolution failed ({error}); falling back to DIRECT by configuration");
+                Ok(Proxies::direct())
+            }
+            Err(error) => Err(error
+                .context("proxy resolution failed and try_direct_on_proxy_failure is disabled")),
+        }
     }
 
     pub async fn handle_connection(
@@ -144,17 +159,52 @@ impl ConnectionManager {
                 .unwrap_or_default()
         );
 
-        let proxies = match self.resolver.resolve(&target_url, &hostname_for_url).await {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("proxy resolution failed ({e}); falling back to DIRECT");
-                Proxies::direct()
-            }
-        };
+        let proxies = self.resolve_proxies(&target_url, &hostname_for_url).await?;
         debug!("Upstream route: {}", proxies);
 
         self.upstream_handler
             .handle_connection(intercepted_conn, stream, proxies)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    async fn manager_with_failing_pac(allow_direct: bool) -> ConnectionManager {
+        let mut pac = tempfile::NamedTempFile::new().unwrap();
+        pac.write_all(
+            br#"function FindProxyForURL(url, host) { throw new Error("evaluation failed"); }"#,
+        )
+        .unwrap();
+        let mut config = TotanConfig {
+            pac_file: Some(pac.path().to_path_buf()),
+            ..TotanConfig::default()
+        };
+        config.mitigation.try_direct_on_proxy_failure = allow_direct;
+        ConnectionManager::new(config).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn pac_failure_is_fail_closed_when_direct_fallback_is_disabled() {
+        let manager = manager_with_failing_pac(false).await;
+        assert!(manager
+            .resolve_proxies("https://example.com/", "example.com")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn pac_failure_uses_direct_only_when_enabled() {
+        let manager = manager_with_failing_pac(true).await;
+        assert_eq!(
+            manager
+                .resolve_proxies("https://example.com/", "example.com")
+                .await
+                .unwrap(),
+            Proxies::direct()
+        );
     }
 }

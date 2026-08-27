@@ -1,6 +1,6 @@
 use crate::http_proxy::{serve_http_connection, HttpProxyContext};
 use crate::proxy::{HostAndPort, Proxies, Proxy, ProxyOrDirect};
-use crate::utils::{format_authority, socket_authority, tolerant_copy_bidirectional};
+use crate::utils::{format_authority, socket_authority, tolerant_copy_bidirectional_with_idle};
 use anyhow::{anyhow, Result};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -43,6 +43,7 @@ pub struct UpstreamHandler {
     handshake_timeout: Duration,
     mitigation: ErrorMitigationConfig,
     upstream_mark: u32,
+    client_idle_timeout: Duration,
 }
 
 impl UpstreamHandler {
@@ -57,16 +58,22 @@ impl UpstreamHandler {
             handshake_timeout: Duration::from_millis(handshake_timeout_ms),
             mitigation,
             upstream_mark,
+            client_idle_timeout: Duration::from_secs(600),
         })
+    }
+
+    pub fn with_client_idle_timeout(mut self, idle_secs: u64) -> Self {
+        self.client_idle_timeout = Duration::from_secs(idle_secs);
+        self
     }
 
     /// Walk the PAC failover list trying each entry until one succeeds. An
     /// entry is "committed" the moment we start relaying client bytes; up to
     /// that point a transport/handshake failure advances to the next entry.
     ///
-    /// The HTTP-over-HTTP-proxy path (plain HTTP target with an HTTP proxy)
-    /// is special: it's delegated to Pingora which owns both streams and
-    /// can't be rolled back. That case ends the loop on the first match.
+    /// The plain-HTTP path is delegated to Pingora. Its per-request context
+    /// walks the remaining PAC entries through Pingora's connect-retry hook,
+    /// including HTTP proxy, SOCKS5 and explicit/mitigation DIRECT routes.
     pub async fn handle_connection(
         &self,
         intercepted_conn: InterceptedConnection,
@@ -79,15 +86,19 @@ impl UpstreamHandler {
         // transport outage, and silently re-routing would leak traffic.
         let mut any_handshake_failure = false;
 
-        for entry in &proxies {
-            // Pingora path: client stream is consumed, no failover possible.
+        for (entry_index, entry) in proxies.iter().enumerate() {
+            // Pingora owns the client stream from the first HTTP-proxy entry
+            // onward and performs the remaining failover internally.
             if intercepted_conn.original_dest.port() != 443 {
-                if let ProxyOrDirect::Proxy(Proxy::Http(ep)) = entry {
-                    let proxy_url = format!("http://{}", ep);
-                    let ctx = HttpProxyContext::new(
+                if let ProxyOrDirect::Proxy(Proxy::Http(_)) = entry {
+                    let ctx = HttpProxyContext::from_entries(
                         intercepted_conn.clone(),
-                        &proxy_url,
+                        proxies.iter().skip(entry_index),
                         self.upstream_mark,
+                        self.connect_timeout,
+                        self.handshake_timeout,
+                        self.client_idle_timeout,
+                        self.mitigation.try_direct_on_proxy_failure,
                     )?;
                     return serve_http_connection(client_stream, ctx).await;
                 }
@@ -97,7 +108,12 @@ impl UpstreamHandler {
                 Ok(mut upstream) => {
                     let _ = client_stream.set_nodelay(true);
                     let _ = upstream.set_nodelay(true);
-                    let _ = tolerant_copy_bidirectional(&mut client_stream, &mut upstream).await;
+                    let _ = tolerant_copy_bidirectional_with_idle(
+                        &mut client_stream,
+                        &mut upstream,
+                        self.client_idle_timeout,
+                    )
+                    .await;
                     return Ok(());
                 }
                 Err(e) => {
@@ -240,7 +256,12 @@ impl UpstreamHandler {
         };
         let _ = client_stream.set_nodelay(true);
         let _ = upstream.set_nodelay(true);
-        let _ = tolerant_copy_bidirectional(&mut client_stream, &mut upstream).await;
+        let _ = tolerant_copy_bidirectional_with_idle(
+            &mut client_stream,
+            &mut upstream,
+            self.client_idle_timeout,
+        )
+        .await;
         Ok(())
     }
 
@@ -460,7 +481,7 @@ impl UpstreamHandler {
 /// Connect to `addr` with optional `SO_MARK`. Resolves hostnames and tries
 /// each resulting address in turn, returning the first successful connection.
 /// When `mark` is zero the socket is created without marking.
-async fn tcp_connect_marked<A: tokio::net::ToSocketAddrs>(
+pub(crate) async fn tcp_connect_marked<A: tokio::net::ToSocketAddrs>(
     addr: A,
     mark: u32,
 ) -> std::io::Result<TcpStream> {

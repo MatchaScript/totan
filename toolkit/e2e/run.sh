@@ -37,6 +37,7 @@
 #   other.test        → 192.0.2.13  :443  HTTPS default PAC → proxy-default
 #   192.0.2.14        →             :80   plain HTTP, PAC IP-route → proxy-a
 #   fail-over.test    → 192.0.2.15  :443  HTTPS failover: dead:1 then :8880
+#   fail-http.test    → 192.0.2.16  :80   HTTP failover: dead:1 then :8880
 #   socks-only.test   → 192.0.2.17  :443  HTTPS via SOCKS5 mock
 #
 # Known gap not tested here: HTTPS on non-443 ports. totan only runs SNI
@@ -77,8 +78,8 @@ PORT_BACKEND_TLS=9443
 
 # eBPF isolation primitives
 POD_NS="totan-e2e-pod"
-PREEXISTING_V4_LOCAL_ROUTE="$(ip route show table 100 type local 0.0.0.0/0)"
-PREEXISTING_V6_LOCAL_ROUTE="$(ip -6 route show table 100 type local ::/0)"
+PREEXISTING_V4_LOCAL_ROUTE="$(ip route show table 100 type local 0.0.0.0/0 2>/dev/null || true)"
+PREEXISTING_V6_LOCAL_ROUTE="$(ip -6 route show table 100 type local ::/0 2>/dev/null || true)"
 
 PROXY_PIDS=()
 BACKEND_PIDS=()
@@ -174,6 +175,7 @@ RESOLVE_MAP+=",b-site.test:443=127.0.0.1:$PORT_BACKEND_TLS"
 RESOLVE_MAP+=",other.test:443=127.0.0.1:$PORT_BACKEND_TLS"
 RESOLVE_MAP+=",other.test:8443=127.0.0.1:$PORT_BACKEND_TLS"
 RESOLVE_MAP+=",fail-over.test:443=127.0.0.1:$PORT_BACKEND_TLS"
+RESOLVE_MAP+=",fail-http.test:80=127.0.0.1:$PORT_BACKEND_HTTP"
 RESOLVE_MAP+=",socks-only.test:443=127.0.0.1:$PORT_BACKEND_TLS"
 RESOLVE_MAP+=",v6-plain.test:80=127.0.0.1:$PORT_BACKEND_HTTP"
 RESOLVE_MAP+=",v6-secure.test:443=127.0.0.1:$PORT_BACKEND_TLS"
@@ -357,6 +359,12 @@ body=$(run_curl --resolve 'plain.test:80:192.0.2.10' \
 assert_log_contains "$PROXY_DEFAULT_LOG" "POST http://plain.test/echo" "post: proxy logged POST"
 assert_log_contains "$BACKEND_HTTP_LOG"  "POST /echo host=plain.test"  "post: backend logged POST"
 assert_eq           "post: body echoed unchanged" "$payload" "$body"
+
+echo
+echo "── scenario 3b: plain HTTP PAC failover → proxy-default ───────────────"
+body=$(run_curl --resolve 'fail-http.test:80:192.0.2.16' 'http://fail-http.test/')
+assert_log_contains "$PROXY_DEFAULT_LOG" "GET http://fail-http.test/" "http-failover: recovered via proxy-default"
+assert_eq           "http-failover: body round-trip" "backend:backend-http" "$body"
 
 echo
 echo "── scenario 4: HTTPS a-site.test → PAC routes to proxy-a → TLS backend ─"

@@ -29,8 +29,8 @@ TOTAN_LOG="$LOG_DIR/totan.log"
 PROXY_LOG="$LOG_DIR/proxy.log"
 
 POD_NS="totan-stress-pod"
-PREEXISTING_V4_LOCAL_ROUTE="$(ip route show table 100 type local 0.0.0.0/0)"
-PREEXISTING_V6_LOCAL_ROUTE="$(ip -6 route show table 100 type local ::/0)"
+PREEXISTING_V4_LOCAL_ROUTE="$(ip route show table 100 type local 0.0.0.0/0 2>/dev/null || true)"
+PREEXISTING_V6_LOCAL_ROUTE="$(ip -6 route show table 100 type local ::/0 2>/dev/null || true)"
 
 PROXY_PID=""
 TOTAN_PID=""
