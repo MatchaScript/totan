@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use totan_common::{config::TotanConfig, InterceptedConnection, InterceptionMode};
+use totan_common::{config::TotanConfig, InterceptedConnection};
 use tracing::{debug, warn};
 
 use crate::pac::PacEvaluator;
@@ -53,19 +53,9 @@ impl ConnectionManager {
             ProxyResolver::Fixed(Proxies::direct())
         };
 
-        // SO_MARK on upstream sockets:
-        //  - netfilter mode: the OUTPUT hook would otherwise re-intercept the
-        //    proxy's own connections, so mark with the netfilter fwmark.
-        //  - eBPF mode: mark with DEFAULT_SELF_MARK (distinct from the routing
-        //    fwmark) so `cgroup/connect4` recognises totan's own egress and
-        //    skips it. This is what makes running totan inside a hooked slice
-        //    (e.g. system.slice) safe. The value must not match any `ip rule`,
-        //    or the egress would be policy-routed to loopback.
-        let upstream_mark = match config.interception_mode {
-            InterceptionMode::Netfilter => config.netfilter.fwmark,
-            #[cfg(feature = "ebpf")]
-            InterceptionMode::Ebpf => crate::ebpf::DEFAULT_SELF_MARK,
-        };
+        // Mark totan's own outbound sockets so `cgroup/connect4` recognises and
+        // skips them. This value must not match any policy-routing rule.
+        let upstream_mark = crate::ebpf::DEFAULT_SELF_MARK;
 
         let upstream_handler = UpstreamHandler::new(
             config.timeouts.upstream_connect_ms,

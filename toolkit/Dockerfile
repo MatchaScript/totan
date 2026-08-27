@@ -10,8 +10,6 @@ RUN apt-get update && apt-get install -y \
     iproute2 \
     tcpdump \
     dnsutils \
-    iptables \
-    nftables \
     tshark \
     bpftrace \
     netcat-openbsd \
@@ -31,13 +29,6 @@ RUN set -x \
     && chown -R root:root /etc/totan /opt/totan \
     && chmod 0755 /etc/totan /opt/totan
 
-# Copy entrypoint script
-COPY toolkit/start-totan.sh /usr/local/bin/start-totan.sh
-RUN chmod +x /usr/local/bin/start-totan.sh
-# Expose default listen port
-EXPOSE 3129
-
-# By default just idle; compose will override with start script
+# Generic diagnostic client used by docker-compose comparison setups.
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/usr/local/bin/start-totan.sh"]
-
+CMD ["sleep", "infinity"]

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Unified e2e runner for totan.
+# eBPF end-to-end runner for totan.
 #
-# Usage: run.sh <netfilter|ebpf>
+# Usage: run.sh
 #
-# Both modes share:
+# The environment includes:
 #   - Three forward-mode mock proxies on 127.0.0.1:8880 / :8881 / :8882
 #   - A mock SOCKS5 proxy on 127.0.0.1:1080
 #   - A plain HTTP backend on 127.0.0.1:9080 (via proxy-default / proxy-a)
@@ -19,25 +19,16 @@
 # known fixtures / echoes). This is stronger than the previous suite, which
 # only verified the proxy logs and never opened a real TLS tunnel.
 #
-# Modes differ in how they intercept the client's traffic:
+# A pod netns with a veth pair is used. totan attaches a tcx ingress program
+# on the host-side veth, sets up fwmark policy routing, and binds an
+# IP_TRANSPARENT listener that recovers the original dst via getsockname().
+# bpf_sk_assign is tc-ingress-only at the kernel level, which is why we hook
+# veth-host ingress rather than an uplink egress.
 #
-#   netfilter: totan manages an inet OUTPUT REDIRECT ruleset. The client
-#              (curl) runs on the host netns; family-specific listeners read
-#              SO_ORIGINAL_DST/IP6T_SO_ORIGINAL_DST on accept.
-#
-#   ebpf:      pod netns with veth pair. totan attaches a tcx ingress program
-#              on the host-side veth, sets up fwmark policy routing, and binds
-#              an IP_TRANSPARENT listener that recovers the original dst via
-#              getsockname(). bpf_sk_assign is tc-ingress-only at the kernel
-#              level, which is why we hook veth-host ingress rather than an
-#              uplink egress.
-#
-#              Additionally, in ebpf mode totan also loads cgroup/connect4 +
-#              sockops + cgroup/sock_release attached to a transient slice
-#              /sys/fs/cgroup/totan-e2e.slice. Host-originated curl scenarios
-#              are migrated into that slice by writing $$ to cgroup.procs;
-#              connect4 rewrites their dst to 127.0.0.1:3130 and userspace
-#              recovers original dst from the BPF sport map.
+# Additionally, totan loads cgroup/connect4 + sockops attached to a transient
+# /sys/fs/cgroup/totan-e2e.slice. Host-originated curl scenarios are migrated
+# into that slice by writing $$ to cgroup.procs; connect4 rewrites their dst to
+# 127.0.0.1:33130 and userspace recovers original dst from the BPF sport map.
 #
 # Scenario layout (host→target mapping via curl --resolve, all in TEST-NET):
 #   plain.test        → 192.0.2.10  :80   plain HTTP → proxy-default → backend
@@ -52,18 +43,12 @@
 # extraction when original_dest.port() == 443, so a CONNECT-style flow on
 # e.g. :8443 falls through to the pingora plain-HTTP pipeline and breaks
 # the TLS handshake. When that is fixed, add a "CONNECT other.test:8443"
-# scenario (and widen the netfilter dport set accordingly).
+# scenario.
 #
 # TEST-NET (192.0.2.0/24) is RFC 5737 documentation space: unreachable, so a
 # successful response only proves totan actually proxied the flow.
 
 set -euo pipefail
-
-MODE="${1:-}"
-case "$MODE" in
-    netfilter|ebpf) ;;
-    *) echo "usage: $0 <netfilter|ebpf>" >&2; exit 2 ;;
-esac
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOLKIT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -90,12 +75,10 @@ PORT_SOCKS=1080
 PORT_BACKEND_HTTP=9080
 PORT_BACKEND_TLS=9443
 
-# netfilter-mode client uid
-TEST_UID=9999
-TEST_USER="totan-e2e-client"
-
-# ebpf-mode isolation primitives
+# eBPF isolation primitives
 POD_NS="totan-e2e-pod"
+PREEXISTING_V4_LOCAL_ROUTE="$(ip route show table 100 type local 0.0.0.0/0)"
+PREEXISTING_V6_LOCAL_ROUTE="$(ip -6 route show table 100 type local ::/0)"
 
 PROXY_PIDS=()
 BACKEND_PIDS=()
@@ -114,16 +97,16 @@ cleanup() {
     done
     wait 2>/dev/null
 
-    if [[ "$MODE" == "netfilter" ]]; then
-        ip -6 route del local 2001:db8::/32 dev lo table local 2>/dev/null
-    else
-        ip rule del fwmark 0x7474 lookup 100 2>/dev/null
+    # The loader removes policy rules it owns. Remove local routes only when
+    # this test caused them to be created; preserve pre-existing host state.
+    [[ -z "$PREEXISTING_V4_LOCAL_ROUTE" ]] && \
         ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
-        ip netns del "$POD_NS" 2>/dev/null
-        ip link del veth-host 2>/dev/null
-        # rmdir succeeds only when no procs remain — they all exit before us.
-        rmdir /sys/fs/cgroup/totan-e2e.slice 2>/dev/null
-    fi
+    [[ -z "$PREEXISTING_V6_LOCAL_ROUTE" ]] && \
+        ip -6 route del local ::/0 dev lo table 100 2>/dev/null
+    ip netns del "$POD_NS" 2>/dev/null
+    ip link del veth-host 2>/dev/null
+    # rmdir succeeds only when no procs remain — they all exit before us.
+    rmdir /sys/fs/cgroup/totan-e2e.slice 2>/dev/null
 
     if [[ "${_E2E_PASS:-0}" == "1" ]]; then
         rm -rf "$LOG_DIR"
@@ -163,10 +146,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
     -addext "subjectAltName=DNS:a-site.test,DNS:b-site.test,DNS:other.test,DNS:fail-over.test,DNS:socks-only.test,DNS:v6-secure.test,DNS:v6-host.test,IP:127.0.0.1" \
     2>/dev/null
 
-# netfilter mode runs curl as an unprivileged uid; mkstemp defaults to 0700
-# so the cert path would be unreadable. Open the directory tree (and the cert,
-# not the key — the key only needs to be readable by the backend, which runs
-# as root here) so `curl --cacert` works from every client context.
+# Open the directory tree and certificate for clients in the pod namespace.
 chmod 755 "$LOG_DIR"
 chmod 644 "$TLS_CERT"
 
@@ -231,62 +211,42 @@ for port in "$PORT_PROXY_DEFAULT" "$PORT_PROXY_A" "$PORT_PROXY_B" \
 done
 
 # ─── generate totan config ────────────────────────────────────────────────────
-src_cfg="$TOOLKIT_DIR/totan.${MODE}-ci.toml"
+src_cfg="$TOOLKIT_DIR/totan.ebpf-ci.toml"
 sed "s|__PAC_PATH__|$PAC_PATH|" "$src_cfg" > "$TOTAN_CFG"
 echo "[e2e] using config $TOTAN_CFG (pac=$PAC_PATH)"
 
-# ─── mode-specific interception setup ────────────────────────────────────────
-if [[ "$MODE" == "netfilter" ]]; then
-    echo "[e2e] netfilter: creating test uid $TEST_UID ($TEST_USER)..."
-    if ! id -u "$TEST_USER" >/dev/null 2>&1; then
-        useradd -u "$TEST_UID" -M -s /bin/bash "$TEST_USER" 2>/dev/null \
-            || useradd -u "$TEST_UID" -M "$TEST_USER"
-    fi
+# ─── eBPF interception setup ─────────────────────────────────────────────────
+echo "[e2e] checking kernel version..."
+KVER=$(uname -r)
+echo "[e2e] kernel $KVER (need ≥ 6.6 for tcx)"
 
-    # connect(2) requires a route before packets reach the OUTPUT hook. A local
-    # route makes the documentation prefix routable without creating a real
-    # endpoint; totan's managed inet rules then redirect both families.
-    echo "[e2e] netfilter: adding IPv6 documentation-prefix local route..."
-    ip -6 route add local 2001:db8::/32 dev lo table local
+echo "[e2e] setting up pod netns..."
+sysctl -qw net.ipv4.conf.all.rp_filter=0
 
-    CURL_PREFIX=(sudo -u "$TEST_USER" --preserve-env=PATH)
+ip netns add "$POD_NS"
+ip link add veth-host type veth peer name veth-pod
+ip link set veth-pod netns "$POD_NS"
+ip link set veth-host up
+ip addr add 10.100.0.1/24 dev veth-host
+ip -6 addr add fd00:100::1/64 dev veth-host nodad
+sysctl -qw net.ipv4.conf.veth-host.rp_filter=0 2>/dev/null || true
 
-else  # ebpf
-    echo "[e2e] ebpf: checking kernel version..."
-    KVER=$(uname -r)
-    echo "[e2e] kernel $KVER (need ≥ 6.6 for tcx)"
+ip netns exec "$POD_NS" ip link set lo up
+ip netns exec "$POD_NS" ip link set veth-pod up
+ip netns exec "$POD_NS" ip addr add 10.100.0.2/24 dev veth-pod
+ip netns exec "$POD_NS" ip route add default via 10.100.0.1
+ip netns exec "$POD_NS" ip -6 addr add fd00:100::2/64 dev veth-pod nodad
+ip netns exec "$POD_NS" ip -6 route add default via fd00:100::1
 
-    echo "[e2e] ebpf: setting up pod netns..."
-    sysctl -qw net.ipv4.conf.all.rp_filter=0
+CURL_PREFIX=(ip netns exec "$POD_NS")
 
-    ip netns add "$POD_NS"
-    ip link add veth-host type veth peer name veth-pod
-    ip link set veth-pod netns "$POD_NS"
-    ip link set veth-host up
-    ip addr add 10.100.0.1/24 dev veth-host
-    ip -6 addr add fd00:100::1/64 dev veth-host nodad
-    sysctl -qw net.ipv4.conf.veth-host.rp_filter=0 2>/dev/null || true
-
-    ip netns exec "$POD_NS" ip link set lo up
-    ip netns exec "$POD_NS" ip link set veth-pod up
-    ip netns exec "$POD_NS" ip addr add 10.100.0.2/24 dev veth-pod
-    ip netns exec "$POD_NS" ip route add default via 10.100.0.1
-    ip netns exec "$POD_NS" ip -6 addr add fd00:100::2/64 dev veth-pod nodad
-    ip netns exec "$POD_NS" ip -6 route add default via fd00:100::1
-
-    CURL_PREFIX=(ip netns exec "$POD_NS")
-
-    # ─── cgroup slice for host-originated scenarios ──────────────────────────
-    # /sys/fs/cgroup/totan-e2e.slice must exist before totan starts so the
-    # cgroup loader can open it for attach. mkdir on cgroup v2 creates a new
-    # cgroup; no further controller subscription is needed for sock_addr /
-    # sockops / sock_release attach (those don't need any controller).
-    echo "[e2e] ebpf: creating /sys/fs/cgroup/totan-e2e.slice for host hooks"
-    mkdir -p /sys/fs/cgroup/totan-e2e.slice
-fi
+# /sys/fs/cgroup/totan-e2e.slice must exist before totan starts so the cgroup
+# loader can open it for attach.
+echo "[e2e] creating /sys/fs/cgroup/totan-e2e.slice for host hooks"
+mkdir -p /sys/fs/cgroup/totan-e2e.slice
 
 # ─── start totan ──────────────────────────────────────────────────────────────
-echo "[e2e] starting totan ($MODE mode)..."
+echo "[e2e] starting totan..."
 "$TOTAN_BIN" --config "$TOTAN_CFG" >"$TOTAN_LOG" 2>&1 &
 TOTAN_PID=$!
 
@@ -303,7 +263,7 @@ for i in $(seq 1 30); do
     fi
 done
 
-[[ "$MODE" == "ebpf" ]] && sleep 0.5
+sleep 0.5
 
 # ─── scenarios ────────────────────────────────────────────────────────────────
 pass=0
@@ -454,7 +414,7 @@ echo "── scenario 10: 20 concurrent HTTPS requests ────────�
 # We fan out N requests with xargs -P and count how many returned the
 # expected body. The pipeline tolerates per-request failures (we *want* the
 # count, not a hard exit) and the chmod 644 on the conc_script ensures the
-# unprivileged netfilter test uid can exec it.
+# pod-netns client can execute it.
 conc_n=20
 conc_expected="backend:backend-tls"
 conc_script="$LOG_DIR/conc.sh"
@@ -476,27 +436,7 @@ if [[ "$oks" != "$conc_n" ]]; then
 fi
 assert_eq "concurrent: ${conc_n}/${conc_n} requests succeeded" "$conc_n" "$oks"
 
-# ─── netfilter-only: IPv6 original-destination recovery ──────────────────────
-if [[ "$MODE" == "netfilter" ]]; then
-    echo
-    echo "── scenario N6-1: netfilter IPv6 HTTP → forward proxy ────────────────"
-    body=$(run_curl --resolve 'v6-plain.test:80:[2001:db8::10]' 'http://v6-plain.test/')
-    assert_log_contains "$PROXY_DEFAULT_LOG" "GET http://v6-plain.test/" "netfilter-ipv6-http: proxy got absolute URI"
-    assert_log_contains "$BACKEND_HTTP_LOG"  "GET / host=v6-plain.test"  "netfilter-ipv6-http: backend got Host"
-    assert_eq           "netfilter-ipv6-http: body round-trip" "backend:backend-http" "$body"
-
-    echo
-    echo "── scenario N6-2: netfilter IPv6 HTTPS → CONNECT ─────────────────────"
-    body=$(run_curl --resolve 'v6-secure.test:443:[2001:db8::11]' 'https://v6-secure.test/')
-    assert_log_contains "$PROXY_DEFAULT_LOG" "CONNECT v6-secure.test:443" "netfilter-ipv6-https: proxy saw CONNECT"
-    assert_log_contains "$BACKEND_TLS_LOG"   "GET / host=v6-secure.test"  "netfilter-ipv6-https: backend got request"
-    assert_eq           "netfilter-ipv6-https: body round-trip" "backend:backend-tls" "$body"
-fi
-
-# ─── ebpf-only: host-originated scenarios via cgroup hooks ───────────────────
-# Skipped under netfilter mode (the netfilter rules redirect by uid, not by
-# cgroup, so the same scenarios would test a different code path).
-if [[ "$MODE" == "ebpf" ]]; then
+# ─── IPv6 and host-originated scenarios via eBPF ──────────────────────────────
     echo
     echo "── scenario P6-1: pod IPv6 HTTP via tc ingress → proxy ───────────────"
     body=$(run_curl --resolve 'v6-plain.test:80:[2001:db8::10]' 'http://v6-plain.test/')
@@ -564,12 +504,10 @@ if [[ "$MODE" == "ebpf" ]]; then
         echo "  ✓ untracked-host: out-of-slice traffic correctly NOT intercepted"
         pass=$((pass + 1))
     fi
-fi
-
 # ─── verdict ──────────────────────────────────────────────────────────────────
 echo
 echo "═══════════════════════════════════════════════════════════════════════"
-echo "  mode: $MODE    passed: $pass    failed: $fail"
+echo "  eBPF    passed: $pass    failed: $fail"
 echo "═══════════════════════════════════════════════════════════════════════"
 
 if [[ "$fail" -gt 0 ]]; then

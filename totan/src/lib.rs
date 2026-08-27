@@ -1,12 +1,9 @@
-#[cfg(feature = "ebpf")]
 pub mod cgroup;
 pub mod cli;
 pub mod connection;
-#[cfg(feature = "ebpf")]
 pub mod ebpf;
 pub mod http_proxy;
 pub mod interceptor;
-pub mod netfilter;
 pub mod pac;
 pub mod proxy;
 pub mod upstream;
