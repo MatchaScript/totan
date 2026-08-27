@@ -78,8 +78,8 @@ PORT_BACKEND_TLS=9443
 
 # eBPF isolation primitives
 POD_NS="totan-e2e-pod"
-PREEXISTING_V4_LOCAL_ROUTE="$(ip route show table 100 type local 0.0.0.0/0)"
-PREEXISTING_V6_LOCAL_ROUTE="$(ip -6 route show table 100 type local ::/0)"
+PREEXISTING_V4_LOCAL_ROUTE="$(ip route show table 100 type local 0.0.0.0/0 2>/dev/null || true)"
+PREEXISTING_V6_LOCAL_ROUTE="$(ip -6 route show table 100 type local ::/0 2>/dev/null || true)"
 
 PROXY_PIDS=()
 BACKEND_PIDS=()
