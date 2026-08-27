@@ -55,7 +55,9 @@
 
 use aya_ebpf::{
     bindings::{bpf_sock_tuple, BPF_TCP_LISTEN, BPF_TCP_TIME_WAIT, TC_ACT_OK},
-    helpers::gen::{bpf_get_socket_cookie, bpf_sk_assign, bpf_sk_release, bpf_skc_lookup_tcp},
+    helpers::generated::{
+        bpf_get_socket_cookie, bpf_sk_assign, bpf_sk_release, bpf_skc_lookup_tcp,
+    },
     macros::{cgroup_sock_addr, classifier, map, sock_ops},
     maps::{Array, LruHashMap},
     programs::{SockAddrContext, SockOpsContext, TcContext},
