@@ -63,7 +63,7 @@ lru = "0.17"
 once_cell = "1"
 
 # eBPF
-aya = "0.13.1"
+aya = "0.14.0"
 aya-log = "0.2.1"
 aya-ebpf = "0.1.1"
 aya-log-ebpf = "0.1.1"
