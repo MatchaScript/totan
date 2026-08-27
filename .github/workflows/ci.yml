@@ -13,12 +13,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt
 
-      - name: Install nightly-2026-03-01 for the eBPF crate
-        run: rustup toolchain install nightly-2026-03-01 --component rust-src --no-self-update
+      - name: Install nightly-2026-08-26 for the eBPF crate
+        run: rustup toolchain install nightly-2026-08-26 --component rust-src --profile minimal --no-self-update
 
       - name: Cache bpf-linker
         id: cache-bpf-linker
