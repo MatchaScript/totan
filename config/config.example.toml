@@ -1,0 +1,104 @@
+# Main configuration for totan
+
+# The local port for totan to listen on (corresponds to --port).
+listen_port = 3129
+
+# The default upstream proxy URL (corresponds to --proxy).
+default_proxy = "http://proxy.example.com:8080"
+
+# PAC file path for dynamic proxy resolution (corresponds to --pac-file).
+# When set, totan evaluates FindProxyForURL(url, host) for every intercepted
+# connection. Return values:
+#   "PROXY host:port"  → forward through that HTTP proxy
+#   "SOCKS5 host:port" → forward through that SOCKS5 proxy
+#   "DIRECT"           → connect directly (no proxy)
+#
+# Enterprise example — Teams/O365 split-tunnelling:
+#   function FindProxyForURL(url, host) {
+#     if (shExpMatch(host, "*.teams.microsoft.com") ||
+#         shExpMatch(host, "*.office365.com") ||
+#         shExpMatch(host, "*.sharepoint.com")) {
+#       return "DIRECT";
+#     }
+#     return "PROXY proxy.corp.example:8080";
+#   }
+pac_file = "/etc/totan/config.pac"
+
+# Traffic interception uses eBPF exclusively. The tc ingress program (via tcx)
+# attaches to named network
+#   interface — typically the host-side veth peer of a container/pod. Intercepts
+#   traffic arriving FROM containers at that interface.
+#
+#   totan has two complementary interception paths:
+#     - tc ingress (ingress_interfaces) — container/pod traffic arriving at a
+#       host-side veth/netkit peer.
+#     - cgroup host hooks ([ebpf.host_hooks]) — host-originated egress (systemd
+#       services, login sessions) that never traverses a pod veth. totan tags
+#       its own sockets with a self-mark that connect4 skips, so it can safely
+#       run inside a hooked slice (e.g. a systemd unit in system.slice) without
+#       looping its own upstream traffic.
+#
+#   Requires: Linux kernel ≥ 6.6 (tcx multi-prog support), CAP_NET_ADMIN + CAP_BPF.
+
+[logging]
+# Log level: "trace", "debug", "info", "warn", or "error".
+level = "info"
+# Log format: "text" for human-readable, "json" for machine-readable.
+format = "json"
+
+[timeouts]
+# Upstream connection timeout in milliseconds.
+upstream_connect_ms = 3000
+# Client connection idle timeout in seconds (0 disables it).
+client_idle_secs = 600
+
+[mitigation]
+# Number of retries after an upstream TCP connect failure.
+retry_attempts = 2
+# Base delay for exponential retry backoff.
+retry_backoff_ms = 200
+# Reset the intercepted client connection when all configured routes fail.
+rst_on_failure = true
+# Permit a last-resort DIRECT connection when PAC evaluation or every proxy
+# connection fails. Set false for mandatory/fail-closed proxy deployments.
+try_direct_on_proxy_failure = false
+
+# ── eBPF interception settings ────────────────────────────────────────────────
+[ebpf]
+# Host-side network interfaces where container/pod traffic arrives. Accepts a
+# list of names or glob patterns (`*`, `?`); every matching interface is
+# attached at startup and new matches are picked up automatically.
+# For a Kubernetes pod this is the host-side end of the pod's veth pair
+# (e.g. "lxc*"); for a Docker bridge network it is the bridge uplink.
+ingress_interfaces = ["veth-host"]
+
+# Port for the IP_TRANSPARENT TPROXY listener. Defaults to listen_port.
+# Override when the TPROXY socket needs a different port from listen_port.
+# tproxy_port = 3129
+
+# fwmark placed on intercepted packets for policy routing. The value triggers
+# `ip rule fwmark <N> lookup 100` so the kernel delivers marked packets locally
+# rather than forwarding them. Default: 0x7474 ("tt" for totan).
+# Avoid Cilium's reserved range (0x0200–0x0E00).
+# fwmark = 0x7474
+
+# ── Host-originated interception via cgroup BPF hooks (optional) ──────────────
+# Captures egress from host processes (systemd services, login sessions, dnf,
+# ssh, …) that never traverses a pod-facing veth and so is invisible to tc
+# ingress. Loads cgroup/connect4 + sockops on the listed cgroup v2 slices.
+# Disabled when this section is absent. Requires cgroup v2 and kernel ≥ 5.7.
+#
+# `ingress_interfaces` may be left empty ([]) to run host hooks ONLY (no tc
+# ingress); totan then starts even when no matching interface is present yet.
+#
+# [ebpf.host_hooks]
+# Local port for the cgroup-redirect listener. Must differ from tproxy_port.
+# Default: 3130.
+# redirect_port = 3130
+#
+# cgroup v2 paths to attach to (the cgroup itself and all descendants). Pod
+# traffic is left to tc ingress, so kubepods.slice is deliberately omitted.
+# totan tags its own egress with a self-mark that connect4 skips, so it is safe
+# to run totan as a systemd unit inside one of these slices.
+# Default: ["/sys/fs/cgroup/system.slice", "/sys/fs/cgroup/user.slice"].
+# slices = ["/sys/fs/cgroup/system.slice", "/sys/fs/cgroup/user.slice"]

@@ -1,0 +1,20 @@
+[package]
+name = "totan-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+aya-ebpf = { workspace = true }
+network-types = { workspace = true }
+
+[[bin]]
+# Must differ from the package name: aya-build uses `$OUT_DIR/<package>` as the
+# nested `--target-dir` and `$OUT_DIR/<bin-target>` as the copy destination, so
+# matching names collide on the final `fs::copy`.
+name = "totan_bpf"
+path = "src/main.rs"
+# Profile tuning for this crate lives in the workspace root Cargo.toml under
+# `[profile.*.package.totan-ebpf]` — profile tables inside non-root members
+# are silently ignored by cargo.

@@ -1,0 +1,43 @@
+# totan configuration for the eBPF e2e CI test.
+# toolkit/e2e/run.sh ebpf creates the pod netns + host-side veth and spawns
+# three mock proxies (8880/8881/8882) before starting totan here.
+
+listen_port = 3129
+
+# Fallback when PAC returns DIRECT or fails to load.
+default_proxy = "http://127.0.0.1:8880"
+
+# PAC is the primary routing policy under test. $PAC_PATH is substituted by
+# run.sh at startup with the absolute path to toolkit/e2e/test.pac.
+pac_file = "__PAC_PATH__"
+
+[logging]
+level = "debug"
+format = "text"
+
+[timeouts]
+upstream_connect_ms = 5000
+
+[mitigation]
+retry_attempts = 1
+retry_backoff_ms = 100
+rst_on_failure = true
+try_direct_on_proxy_failure = false
+
+[ebpf]
+# Host side of the veth pair carrying pod traffic — the tc ingress classifier
+# picks up pod-originated SYNs here and sk_assigns them to the TPROXY listener.
+ingress_interfaces = ["veth-host"]
+tproxy_port = 3129
+# Set on sk_assign'd packets; the loader installs IPv4/IPv6 fwmark rules and
+# local routes in table 100 so marked packets get delivered locally regardless
+# of their destination.
+fwmark = 0x7474
+
+# Host-originated traffic (kubelet, dnf, anything not in a pod) is captured
+# via cgroup BPF hooks instead of tc ingress. The runner creates the slice
+# at /sys/fs/cgroup/totan-e2e.slice before totan starts, and host-side curls
+# are launched into it by writing $$ to cgroup.procs.
+[ebpf.host_hooks]
+redirect_port = 33130
+slices = ["/sys/fs/cgroup/totan-e2e.slice"]

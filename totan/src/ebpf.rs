@@ -1,0 +1,468 @@
+//! Aya loader for the tc ingress classifier that hijacks TCP/80 and TCP/443
+//! arriving from clients (e.g. pod-facing veth or netkit host peer) and
+//! delivers them to a local TPROXY listener via `bpf_sk_assign`.
+//!
+//! ## Required host setup
+//!
+//! After `Loader::load_and_attach`, the caller (or a cluster administrator)
+//! must ensure the following policy routing rules are present. Without them
+//! `ip_route_input()` won't find a local route for external dst IPs, and the
+//! `sk_assign`-tagged packets will be forwarded/dropped instead of delivered
+//! to the TPROXY socket:
+//!
+//! ```text
+//! ip rule add fwmark <FWMARK> lookup 100 priority 100
+//! ip route add local 0.0.0.0/0 dev lo table 100
+//! ip -6 rule add fwmark <FWMARK> lookup 100 priority 100
+//! ip -6 route add local ::/0 dev lo table 100
+//! ```
+//!
+//! `Loader::setup_policy_routing` applies these rules automatically at startup
+//! and removes them on drop if `cleanup_on_drop` is set.
+//!
+//! ## Why tc ingress
+//!
+//! `bpf_sk_assign` is gated in the kernel to the tc ingress path
+//! (`net/core/filter.c`: `if (!skb_at_tc_ingress(skb)) return -EOPNOTSUPP;`).
+//! For client-originated traffic, tc ingress of the host-side peer of the
+//! client's network pair device (veth / netkit) is the first tc hook the
+//! packet reaches on the host and is the natural attach point.
+//!
+//! ## Companion: cgroup hooks for host-originated traffic
+//!
+//! tc ingress only sees packets that traverse a tc hook on the host. Host
+//! processes (kubelet, containerd, dnf, ssh sessions) emit packets directly
+//! via the physical NIC's egress and never hit any pod-facing veth, so they
+//! would escape totan entirely. The companion module [`crate::cgroup`]
+//! attaches `cgroup/connect4` + `sockops` to systemd slices to capture them.
+//! The two subsystems are independent: tc ingress uses TPROXY + `sk_assign`;
+//! cgroup hooks rewrite `connect(2)` and recover original-dst from a
+//! sport-keyed BPF map.
+
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::process::Command;
+
+use aya::{
+    include_bytes_aligned,
+    maps::Array,
+    programs::{tc::TcAttachOptions, LinkOrder, SchedClassifier, TcAttachType},
+    Ebpf, EbpfLoader,
+};
+use aya_log::EbpfLogger;
+use tracing::{info, warn};
+
+/// Default fwmark placed on redirected packets. Distinct from Cilium's mark
+/// range (0x0200–0x0E00) and IPTables connmark ranges.
+pub const DEFAULT_FWMARK: u32 = 0x7474; // "tt" for totan
+
+/// Mark placed on totan's *own* outbound sockets so `cgroup/connect4` can
+/// recognise and skip them (self-exclusion). MUST differ from `DEFAULT_FWMARK`
+/// and MUST NOT be referenced by any `ip rule`, otherwise totan's own egress
+/// would be policy-routed to loopback. Kept adjacent to the fwmark value.
+pub const DEFAULT_SELF_MARK: u32 = 0x7475;
+
+/// Layout-compatible mirror of the kernel-side `TproxyConfig` in
+/// `totan-ebpf/src/main.rs`. Both sides **must** be updated in lock-step.
+///
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct TproxyConfig {
+    pub tproxy_ipv4_be: u32,
+    pub tproxy_ipv6_be: [u32; 4],
+    pub tproxy_port_be: u16,
+    pub _pad0: u16,
+    pub fwmark: u32,
+    pub _pad1: u32,
+}
+
+// SAFETY: #[repr(C)], all fields are integers, explicit padding zeroes the
+// trailing bytes — the kernel verifier will see a fully initialised struct.
+unsafe impl aya::Pod for TproxyConfig {}
+
+pub struct Loader {
+    // Held for RAII: dropping `_ebpf` detaches all programs and tears down maps.
+    _ebpf: Ebpf,
+    // Each element keeps one tcx attachment alive; drop = detach.
+    links: Vec<aya::programs::tc::SchedClassifierLink>,
+    fwmark: u32,
+    owned_routing: RoutingOwnership,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct RoutingOwnership {
+    ipv4_rule: bool,
+    ipv6_rule: bool,
+}
+
+impl Loader {
+    /// Load the tc ingress program, configure the `TOTAN_CONFIG` map, then
+    /// tcx-attach it to every interface in `ingress_ifaces` with first-position
+    /// ordering. Policy routing is also configured automatically.
+    pub fn load_and_attach(
+        ingress_ifaces: &[&str],
+        tproxy_ipv4: Ipv4Addr,
+        tproxy_ipv6: Ipv6Addr,
+        tproxy_port: u16,
+        fwmark: u32,
+    ) -> anyhow::Result<Self> {
+        let elf = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/totan_bpf"));
+
+        let mut ebpf = EbpfLoader::new().load(elf)?;
+
+        if let Err(e) = EbpfLogger::init(&mut ebpf) {
+            warn!("aya-log init skipped (no log map in totan-ebpf yet): {}", e);
+        }
+
+        let mut config_map: Array<_, TproxyConfig> = Array::try_from(
+            ebpf.map_mut("TOTAN_CONFIG")
+                .ok_or_else(|| anyhow::anyhow!("TOTAN_CONFIG map not found in ELF"))?,
+        )?;
+        let cfg = TproxyConfig {
+            tproxy_ipv4_be: u32::from(tproxy_ipv4).to_be(),
+            tproxy_ipv6_be: ipv6_to_be_words(tproxy_ipv6),
+            tproxy_port_be: tproxy_port.to_be(),
+            _pad0: 0,
+            fwmark,
+            _pad1: 0,
+        };
+        config_map.set(0, cfg, 0)?;
+
+        let program: &mut SchedClassifier = ebpf
+            .program_mut("totan_tc_ingress")
+            .ok_or_else(|| anyhow::anyhow!("totan_tc_ingress not found in ELF"))?
+            .try_into()?;
+        program.load()?;
+
+        // tcx attach with first-position ordering for Cilium coexistence.
+        // `LinkOrder::first()` installs us before any existing tcx programs on
+        // the same hook so sk_assign runs before downstream policy/NAT.
+        let mut links = Vec::with_capacity(ingress_ifaces.len());
+        for iface in ingress_ifaces {
+            let link_id = program.attach_with_options(
+                iface,
+                TcAttachType::Ingress,
+                TcAttachOptions::TcxOrder(LinkOrder::first()),
+            )?;
+            links.push(program.take_link(link_id)?);
+            info!(
+                interface = iface,
+                tproxy_ipv4 = %format!("{}:{}", tproxy_ipv4, tproxy_port),
+                tproxy_ipv6 = %format!("[{}]:{}", tproxy_ipv6, tproxy_port),
+                fwmark = format!("0x{:04X}", fwmark),
+                "totan eBPF tc ingress attached"
+            );
+        }
+
+        let owned = setup_policy_routing(fwmark)?;
+        Ok(Self {
+            _ebpf: ebpf,
+            links,
+            fwmark,
+            owned_routing: owned,
+        })
+    }
+
+    /// Attach the already-loaded tc program to an additional interface.
+    /// Called by the interface watcher when a new matching device appears.
+    pub fn attach_interface(&mut self, iface: &str) -> anyhow::Result<()> {
+        let program: &mut SchedClassifier = self
+            ._ebpf
+            .program_mut("totan_tc_ingress")
+            .ok_or_else(|| anyhow::anyhow!("totan_tc_ingress not found"))?
+            .try_into()?;
+        let link_id = program.attach_with_options(
+            iface,
+            TcAttachType::Ingress,
+            TcAttachOptions::TcxOrder(LinkOrder::first()),
+        )?;
+        self.links.push(program.take_link(link_id)?);
+        info!(
+            interface = iface,
+            "totan eBPF tc ingress attached to new interface"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for Loader {
+    fn drop(&mut self) {
+        // _link drop detaches the tcx program automatically.
+        teardown_policy_routing(self.fwmark, self.owned_routing);
+    }
+}
+
+fn ipv6_to_be_words(addr: Ipv6Addr) -> [u32; 4] {
+    let octets = addr.octets();
+    let mut words = [0u32; 4];
+    for (word, chunk) in words.iter_mut().zip(octets.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*chunk).to_be();
+    }
+    words
+}
+
+/// Install `ip rule` + `ip route` entries that make fwmark-tagged packets
+/// delivered locally regardless of their destination IP.
+///
+/// Returns `true` if we installed the rules (so `Drop` can clean them up),
+/// `false` if they were already present.
+fn setup_policy_routing(fwmark: u32) -> anyhow::Result<RoutingOwnership> {
+    let ipv4_rule = setup_policy_routing_for_family(fwmark, false)?;
+    let ipv6_rule = match setup_policy_routing_for_family(fwmark, true) {
+        Ok(owned) => owned,
+        Err(error) => {
+            if ipv4_rule {
+                teardown_policy_rule(fwmark, false);
+            }
+            return Err(error);
+        }
+    };
+    Ok(RoutingOwnership {
+        ipv4_rule,
+        ipv6_rule,
+    })
+}
+
+fn setup_policy_routing_for_family(fwmark: u32, ipv6: bool) -> anyhow::Result<bool> {
+    let family_args: &[&str] = if ipv6 { &["-6"] } else { &[] };
+    let rule_check = Command::new("ip")
+        .args(family_args)
+        .args(["rule", "show", "lookup", "100"])
+        .output()?;
+    let already_present =
+        String::from_utf8_lossy(&rule_check.stdout).contains(&format!("0x{:x}", fwmark));
+
+    if !already_present {
+        let mark = format!("0x{:x}", fwmark);
+        let mut rule_args = Vec::with_capacity(10);
+        rule_args.extend_from_slice(family_args);
+        rule_args.extend_from_slice(&[
+            "rule", "add", "fwmark", &mark, "lookup", "100", "priority", "100",
+        ]);
+        let s = Command::new("ip").args(&rule_args).status()?;
+        if !s.success() {
+            return Err(anyhow::anyhow!(
+                "`ip {}rule add fwmark` failed — is CAP_NET_ADMIN granted?",
+                if ipv6 { "-6 " } else { "" }
+            ));
+        }
+        let prefix = if ipv6 { "::/0" } else { "0.0.0.0/0" };
+        if let Err(error) = ensure_local_route(prefix, family_args) {
+            teardown_policy_rule(fwmark, ipv6);
+            return Err(error);
+        }
+        info!(
+            family = if ipv6 { "ipv6" } else { "ipv4" },
+            fwmark = format!("0x{:04X}", fwmark),
+            "policy routing configured"
+        );
+        Ok(true)
+    } else {
+        let prefix = if ipv6 { "::/0" } else { "0.0.0.0/0" };
+        ensure_local_route(prefix, family_args)?;
+        info!(
+            family = if ipv6 { "ipv6" } else { "ipv4" },
+            fwmark = format!("0x{:04X}", fwmark),
+            "policy routing already present"
+        );
+        Ok(false)
+    }
+}
+
+fn ensure_local_route(prefix: &str, family_args: &[&str]) -> anyhow::Result<()> {
+    let output = Command::new("ip")
+        .args(family_args)
+        .args(["route", "show", "table", "100", "type", "local", prefix])
+        .output()?;
+    // iproute2 renders 0.0.0.0/0 and ::/0 as "default", so checking the
+    // printed prefix is not portable. A filtered query with non-empty output
+    // is authoritative regardless of the display spelling.
+    if output.status.success() && !output.stdout.is_empty() {
+        return Ok(());
+    }
+
+    let mut route_args = Vec::with_capacity(10);
+    route_args.extend_from_slice(family_args);
+    route_args.extend_from_slice(&["route", "add", "local", prefix, "dev", "lo", "table", "100"]);
+    let status = Command::new("ip").args(&route_args).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "failed to install local route {prefix} in table 100"
+        ))
+    }
+}
+
+fn teardown_policy_routing(fwmark: u32, owned: RoutingOwnership) {
+    if owned.ipv4_rule {
+        teardown_policy_rule(fwmark, false);
+    }
+    if owned.ipv6_rule {
+        teardown_policy_rule(fwmark, true);
+    }
+    // Leave table 100 route in place — other consumers may share it.
+}
+
+fn teardown_policy_rule(fwmark: u32, ipv6: bool) {
+    let mark = format!("0x{:x}", fwmark);
+    let mut args = Vec::with_capacity(8);
+    if ipv6 {
+        args.push("-6");
+    }
+    args.extend_from_slice(&["rule", "del", "fwmark", &mark, "lookup", "100"]);
+    let _ = Command::new("ip").args(&args).status();
+}
+
+/// Enumerate `/sys/class/net` and return all interface names that match at
+/// least one of the given patterns. Patterns support `*` (any sequence) and
+/// `?` (any single character); a pattern with no wildcards is an exact match.
+pub fn resolve_interfaces(patterns: &[String]) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return vec![];
+    };
+    let mut matched: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            patterns
+                .iter()
+                .any(|p| glob_match(p.as_bytes(), name.as_bytes()))
+        })
+        .collect();
+    matched.sort_unstable();
+    matched
+}
+
+fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
+    match pattern.first() {
+        None => name.is_empty(),
+        Some(b'*') => {
+            glob_match(&pattern[1..], name) || (!name.is_empty() && glob_match(pattern, &name[1..]))
+        }
+        Some(b'?') => !name.is_empty() && glob_match(&pattern[1..], &name[1..]),
+        Some(&c) => name.first() == Some(&c) && glob_match(&pattern[1..], &name[1..]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aya::programs::SchedClassifier;
+
+    fn m(pattern: &str, name: &str) -> bool {
+        glob_match(pattern.as_bytes(), name.as_bytes())
+    }
+
+    #[test]
+    fn tproxy_config_layout_is_stable() {
+        assert_eq!(core::mem::size_of::<TproxyConfig>(), 32);
+        assert_eq!(core::mem::align_of::<TproxyConfig>(), 4);
+        assert_eq!(
+            ipv6_to_be_words(Ipv6Addr::LOCALHOST),
+            [0, 0, 0, 1u32.to_be()]
+        );
+    }
+
+    /// Load the dual-stack tc classifier through the kernel verifier without
+    /// attaching it. Requires root/CAP_BPF and is exercised explicitly in CI.
+    #[test]
+    #[ignore]
+    fn load_tc_ingress_verifies() {
+        let elf = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/totan_bpf"));
+        let mut ebpf = EbpfLoader::new().load(elf).expect("load ELF + maps");
+        let program: &mut SchedClassifier = ebpf
+            .program_mut("totan_tc_ingress")
+            .expect("totan_tc_ingress present")
+            .try_into()
+            .expect("program is SchedClassifier");
+        program.load().expect("tc ingress must pass verifier");
+    }
+
+    #[test]
+    fn glob_exact() {
+        assert!(m("eth0", "eth0"));
+        assert!(!m("eth0", "eth1"));
+        assert!(!m("eth0", "eth"));
+        assert!(!m("eth0", "eth00"));
+    }
+
+    #[test]
+    fn glob_star() {
+        assert!(m("lxc*", "lxc12345678"));
+        assert!(m("lxc*", "lxc"));
+        assert!(!m("lxc*", "vlxc1"));
+        assert!(m("*", "eth0"));
+        assert!(m("*", "lo"));
+        assert!(m("*", ""));
+        assert!(m("eth*0", "eth0"));
+        assert!(m("eth*0", "eth123450"));
+        assert!(!m("eth*0", "eth1"));
+    }
+
+    #[test]
+    fn glob_question() {
+        assert!(m("eth?", "eth0"));
+        assert!(m("eth?", "etha"));
+        assert!(!m("eth?", "eth"));
+        assert!(!m("eth?", "eth12"));
+        assert!(m("lxc????????", "lxc12345678"));
+        assert!(!m("lxc????????", "lxc1234567"));
+    }
+
+    #[test]
+    fn glob_empty_pattern() {
+        assert!(m("", ""));
+        assert!(!m("", "a"));
+    }
+
+    #[test]
+    fn glob_multiple_stars() {
+        assert!(m("**", "anything"));
+        assert!(m("l*x*", "lxc1"));
+        assert!(m("l*x*", "loopbackxyz"));
+        assert!(!m("l*x*", "eth0"));
+    }
+
+    #[test]
+    fn resolve_lo_exact() {
+        // `lo` is present on every Linux host; sanity-check resolve_interfaces.
+        let result = resolve_interfaces(&["lo".to_string()]);
+        assert!(
+            result.contains(&"lo".to_string()),
+            "lo must be in /sys/class/net"
+        );
+    }
+
+    #[test]
+    fn resolve_star_includes_lo() {
+        let result = resolve_interfaces(&["*".to_string()]);
+        assert!(result.contains(&"lo".to_string()));
+    }
+
+    #[test]
+    fn resolve_no_match() {
+        let result = resolve_interfaces(&["__no_such_iface__".to_string()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_sorted() {
+        let result = resolve_interfaces(&["*".to_string()]);
+        let mut sorted = result.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            result, sorted,
+            "resolve_interfaces must return sorted names"
+        );
+    }
+
+    #[test]
+    fn resolve_multiple_patterns() {
+        // "lo" exact + "*" wildcard — no duplicates expected from real /sys/class/net
+        // because HashSet dedup is not used; but sorted uniqueness: lo appears once.
+        let result = resolve_interfaces(&["lo".to_string(), "*".to_string()]);
+        let lo_count = result.iter().filter(|n| n.as_str() == "lo").count();
+        // With `any()` filtering each name once, lo appears exactly once.
+        assert_eq!(lo_count, 1);
+    }
+}

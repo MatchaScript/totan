@@ -1,0 +1,92 @@
+use clap::Parser;
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+pub struct CliArgs {
+    /// Port to listen on
+    #[arg(short, long)]
+    pub port: Option<u16>,
+
+    /// Default upstream proxy URL (e.g., http://proxy.example.com:8080)
+    #[arg(long)]
+    pub proxy: Option<String>,
+
+    /// Path to PAC file for dynamic proxy resolution
+    #[arg(long)]
+    pub pac_file: Option<PathBuf>,
+
+    /// PAC result cache TTL in seconds (0 disables caching)
+    #[arg(long)]
+    pub pac_cache_ttl: Option<u64>,
+
+    /// PAC result cache maximum number of entries
+    #[arg(long)]
+    pub pac_cache_size: Option<usize>,
+
+    /// Configuration file path
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long)]
+    pub log_level: Option<String>,
+
+    /// Log format: text or json
+    #[arg(long)]
+    pub log_format: Option<String>,
+
+    /// Enable cgroup-based interception of host-originated traffic
+    /// (kubelet, containerd, dnf, etc.).
+    /// When set, totan attaches `cgroup/connect4` + `sockops` BPF programs
+    /// to the slice paths in the [ebpf.host_hooks] config (or the defaults
+    /// if the section is absent).
+    #[arg(long, default_value_t = false)]
+    pub ebpf_host_hooks: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_parsing_basic() {
+        let args = CliArgs::try_parse_from([
+            "totan",
+            "--port",
+            "8080",
+            "--proxy",
+            "http://localhost:3128",
+        ])
+        .unwrap();
+        assert_eq!(args.port, Some(8080));
+        assert_eq!(args.proxy, Some("http://localhost:3128".to_string()));
+    }
+
+    #[test]
+    fn test_cli_parsing_pac() {
+        let args = CliArgs::try_parse_from([
+            "totan",
+            "--pac-file",
+            "/etc/proxy.pac",
+            "--pac-cache-ttl",
+            "300",
+        ])
+        .unwrap();
+        assert_eq!(args.pac_file, Some(PathBuf::from("/etc/proxy.pac")));
+        assert_eq!(args.pac_cache_ttl, Some(300));
+    }
+
+    #[test]
+    fn test_cli_default_host_hooks_off() {
+        let args = CliArgs::try_parse_from(["totan"]).unwrap();
+        assert!(!args.ebpf_host_hooks);
+    }
+
+    #[test]
+    fn test_cli_parsing_host_hooks_flag() {
+        let args = CliArgs::try_parse_from(["totan", "--ebpf-host-hooks"]).unwrap();
+        assert!(args.ebpf_host_hooks);
+    }
+}

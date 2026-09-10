@@ -1,0 +1,34 @@
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    iproute2 \
+    iptables \
+    nftables \
+    dnsutils \
+    netcat-openbsd \
+    apache2-utils \
+    tini \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Create users similar to other client images
+RUN set -x \
+    && groupadd --system --gid 105 totan \
+    && useradd --system --gid totan --no-create-home --home /nonexistent --comment "totan user" --shell /bin/false --uid 105 totan \
+    && (getent group 999 >/dev/null || groupadd --gid 999 tester) \
+    && (id -u 999 >/dev/null 2>&1 || useradd --uid 999 --gid 999 --create-home --home /home/tester --comment "test user" --shell /bin/sh tester)
+
+# Install go-transproxy binary from release
+RUN curl -fsSL https://github.com/wadahiro/go-transproxy/releases/download/v0.5.2/go-transproxy-0.5.2.tar.gz \
+    | tar xz -C /usr/local/bin --strip-components=1
+
+# Copy start script
+COPY toolkit/start-go-transproxy.sh /usr/local/bin/start-go-transproxy.sh
+RUN chmod +x /usr/local/bin/start-go-transproxy.sh
+
+EXPOSE 3128 3129 3130 3131
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/usr/local/bin/start-go-transproxy.sh"]

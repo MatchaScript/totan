@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Check, Test & Build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Install nightly-2026-08-26 for the eBPF crate
+        run: rustup toolchain install nightly-2026-08-26 --component rust-src --profile minimal --no-self-update
+
+      - name: Cache bpf-linker
+        id: cache-bpf-linker
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ runner.os }}-x86_64-v0.11.0
+
+      - name: Install bpf-linker
+        if: steps.cache-bpf-linker.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+          curl -fsSL -o /tmp/bpf-linker.tar.zst \
+            https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          tar -xpf /tmp/bpf-linker.tar.zst -C ~/.cargo/bin
+          bpf-linker --version
+
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Check
+        run: cargo check --locked --workspace --exclude totan-ebpf
+      - name: Clippy
+        run: cargo clippy --locked --workspace --exclude totan-ebpf --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --workspace --exclude totan-ebpf
+      - name: Build release binary
+        run: cargo build --locked -p totan --release
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: totan-release
+          path: target/release/totan
+          retention-days: 1
+
+  e2e:
+    name: E2E (eBPF, PAC routing)
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: totan-release
+          path: target/release/
+      - name: Make totan executable
+        run: chmod +x target/release/totan
+      - name: Verify kernel version
+        run: |
+          echo "kernel: $(uname -r)"
+          uname -r | awk -F. '{exit !(($1 > 6) || ($1 == 6 && $2 >= 6))}'
+      - name: Run eBPF e2e
+        run: sudo --preserve-env=PATH bash toolkit/e2e/run.sh

@@ -1,0 +1,374 @@
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+fn default_listen_port() -> u16 {
+    3129
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TotanConfig {
+    /// The local port for totan to listen on
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+
+    /// The default upstream proxy URL
+    pub default_proxy: Option<String>,
+
+    /// Path to the PAC file for dynamic proxy resolution
+    pub pac_file: Option<PathBuf>,
+
+    /// PAC result cache TTL in seconds (0 to disable caching)
+    #[serde(default = "default_pac_cache_ttl_secs")]
+    pub pac_cache_ttl_secs: u64,
+
+    /// PAC result cache maximum number of entries
+    #[serde(default = "default_pac_cache_max_entries")]
+    pub pac_cache_max_entries: usize,
+
+    /// Maximum number of connections handled simultaneously. Once reached, new
+    /// connections wait for a slot (backpressure) instead of growing tasks and
+    /// file descriptors without bound.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+
+    /// Logging configuration
+    #[serde(default)]
+    pub logging: LoggingConfig,
+
+    /// Timeout configuration
+    #[serde(default)]
+    pub timeouts: TimeoutConfig,
+
+    /// Error mitigation configuration
+    #[serde(default)]
+    pub mitigation: ErrorMitigationConfig,
+
+    /// eBPF interception configuration.
+    #[serde(default)]
+    pub ebpf: EbpfConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EbpfConfig {
+    /// Interface names or glob patterns (supports `*` and `?`) for the
+    /// host-side peers of client network devices (veth / netkit). The tc
+    /// ingress classifier is attached to every matching interface at startup,
+    /// and newly-appearing interfaces that match are picked up automatically.
+    ///
+    /// Examples:
+    ///   `["lxc*"]`        — all Cilium pod veth pairs
+    ///   `["eth0", "ens*"]` — specific + wildcard
+    #[serde(default)]
+    pub ingress_interfaces: Vec<String>,
+
+    /// Localhost TPROXY listener port. The tc ingress program assigns matching
+    /// flows to family-matched listeners on `127.0.0.1` and `::1` via
+    /// `bpf_sk_assign`.
+    /// Defaults to the top-level `listen_port` when unset.
+    #[serde(default)]
+    pub tproxy_port: Option<u16>,
+
+    /// fwmark placed on packets after `bpf_sk_assign` so the kernel's policy
+    /// routing delivers them locally instead of forwarding. The loader
+    /// automatically installs IPv4/IPv6 fwmark rules and local routes in
+    /// routing table 100 at startup.
+    /// Must not overlap with Cilium's mark range (0x0200–0x0E00).
+    /// Default: 0x7474.
+    #[serde(default = "default_fwmark")]
+    pub fwmark: u32,
+
+    /// Optional host-process interception via cgroup BPF hooks
+    /// (`cgroup/connect4` + `cgroup/connect6` + `sockops`). Disabled when absent.
+    /// See `HostHooksConfig` for details.
+    #[serde(default)]
+    pub host_hooks: Option<HostHooksConfig>,
+}
+
+/// Cgroup-based host egress interception. When present, totan loads
+/// `cgroup/connect4` + `cgroup/connect6` + `sockops` BPF programs and attaches them to the
+/// listed cgroup paths. Connections from processes inside those cgroups
+/// (and their descendants) targeting TCP/80 or TCP/443 are redirected
+/// to family-matched loopback listeners, where a plain TCP listener accepts
+/// them and recovers the original destination via a BPF map.
+///
+/// Pod traffic is **not** affected by this — pod processes live under
+/// `kubepods.slice`, deliberately omitted from the default slice list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostHooksConfig {
+    /// Local port for the cgroup-redirect listener. Must differ from the
+    /// TPROXY port used by tc ingress to keep accept loops separable.
+    #[serde(default = "default_host_redirect_port")]
+    pub redirect_port: u16,
+
+    /// cgroup v2 paths to attach to. Each path must exist and be a
+    /// directory under `/sys/fs/cgroup/`. Programs apply to the cgroup
+    /// itself and all descendants.
+    #[serde(default = "default_host_slices")]
+    pub slices: Vec<PathBuf>,
+}
+
+fn default_host_redirect_port() -> u16 {
+    3130
+}
+
+fn default_host_slices() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/sys/fs/cgroup/system.slice"),
+        PathBuf::from("/sys/fs/cgroup/user.slice"),
+    ]
+}
+
+impl Default for HostHooksConfig {
+    fn default() -> Self {
+        Self {
+            redirect_port: default_host_redirect_port(),
+            slices: default_host_slices(),
+        }
+    }
+}
+
+fn default_fwmark() -> u32 {
+    0x7474 // "tt" for totan; distinct from Cilium's 0x0200–0x0E00 range
+}
+
+impl Default for EbpfConfig {
+    fn default() -> Self {
+        Self {
+            ingress_interfaces: Vec::new(),
+            tproxy_port: None,
+            fwmark: default_fwmark(),
+            host_hooks: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_hooks_tests {
+    use super::*;
+
+    #[test]
+    fn ebpf_config_default_host_hooks_disabled() {
+        let cfg = EbpfConfig::default();
+        assert!(cfg.host_hooks.is_none(), "host_hooks must default to None");
+    }
+
+    #[test]
+    fn ebpf_config_parses_host_hooks_section() {
+        let toml_src = r#"
+            ingress_interfaces = ["lxc*"]
+            tproxy_port = 3129
+
+            [host_hooks]
+            redirect_port = 3130
+            slices = ["/sys/fs/cgroup/system.slice"]
+        "#;
+        let cfg: EbpfConfig = toml::from_str(toml_src).unwrap();
+        let hh = cfg.host_hooks.expect("host_hooks must parse");
+        assert_eq!(hh.redirect_port, 3130);
+        assert_eq!(
+            hh.slices,
+            vec![PathBuf::from("/sys/fs/cgroup/system.slice")]
+        );
+    }
+
+    #[test]
+    fn host_hooks_config_default_slices() {
+        let hh = HostHooksConfig::default();
+        assert_eq!(
+            hh.slices,
+            vec![
+                PathBuf::from("/sys/fs/cgroup/system.slice"),
+                PathBuf::from("/sys/fs/cgroup/user.slice"),
+            ]
+        );
+        assert_eq!(hh.redirect_port, 3130);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingConfig {
+    /// Log level: "trace", "debug", "info", "warn", or "error"
+    #[serde(default = "default_log_level")]
+    pub level: String,
+
+    /// Log format: "text" for human-readable, "json" for machine-readable
+    #[serde(default = "default_log_format")]
+    pub format: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: default_log_format(),
+        }
+    }
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_log_format() -> String {
+    "text".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeoutConfig {
+    /// Upstream connection timeout in milliseconds
+    #[serde(default = "default_upstream_connect_ms")]
+    pub upstream_connect_ms: u64,
+
+    /// Deadline in milliseconds for negotiation reads that would otherwise block
+    /// indefinitely: client SNI/ClientHello sniffing and the upstream proxy
+    /// CONNECT / SOCKS5 handshake. Bounds slow-loris-style connection pinning.
+    #[serde(default = "default_handshake_ms")]
+    pub handshake_ms: u64,
+
+    /// Client connection idle timeout in seconds (0 disables the timeout)
+    #[serde(default = "default_client_idle_secs")]
+    pub client_idle_secs: u64,
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            upstream_connect_ms: default_upstream_connect_ms(),
+            handshake_ms: default_handshake_ms(),
+            client_idle_secs: default_client_idle_secs(),
+        }
+    }
+}
+
+fn default_upstream_connect_ms() -> u64 {
+    3000
+}
+
+fn default_handshake_ms() -> u64 {
+    5000
+}
+
+fn default_client_idle_secs() -> u64 {
+    600
+}
+
+impl Default for TotanConfig {
+    fn default() -> Self {
+        Self {
+            listen_port: 3129,
+            default_proxy: None,
+            pac_file: None,
+            pac_cache_ttl_secs: default_pac_cache_ttl_secs(),
+            pac_cache_max_entries: default_pac_cache_max_entries(),
+            max_connections: default_max_connections(),
+            logging: Default::default(),
+            timeouts: Default::default(),
+            mitigation: Default::default(),
+            ebpf: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorMitigationConfig {
+    /// Number of retry attempts on upstream connect failures (0 = no retry)
+    #[serde(default = "default_retry_attempts")]
+    pub retry_attempts: u32,
+
+    /// Base backoff in milliseconds between retries (exponential backoff)
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+
+    /// Send TCP RST to client on failure to trigger client retry
+    #[serde(default = "default_rst_on_failure")]
+    pub rst_on_failure: bool,
+
+    /// If proxy connection fails, try direct connection as a fallback
+    #[serde(default = "default_try_direct_on_proxy_failure")]
+    pub try_direct_on_proxy_failure: bool,
+}
+
+impl Default for ErrorMitigationConfig {
+    fn default() -> Self {
+        Self {
+            retry_attempts: default_retry_attempts(),
+            retry_backoff_ms: default_retry_backoff_ms(),
+            rst_on_failure: default_rst_on_failure(),
+            try_direct_on_proxy_failure: default_try_direct_on_proxy_failure(),
+        }
+    }
+}
+
+fn default_retry_attempts() -> u32 {
+    2
+}
+fn default_retry_backoff_ms() -> u64 {
+    200
+}
+fn default_rst_on_failure() -> bool {
+    true
+}
+fn default_try_direct_on_proxy_failure() -> bool {
+    true
+}
+
+fn default_pac_cache_ttl_secs() -> u64 {
+    60
+}
+fn default_pac_cache_max_entries() -> usize {
+    4096
+}
+fn default_max_connections() -> usize {
+    8192
+}
+
+#[cfg(test)]
+mod config_example_tests {
+    use super::*;
+
+    fn example_toml() -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../config/config.example.toml");
+        std::fs::read_to_string(path).expect("read config.example.toml")
+    }
+
+    /// The shipped example must deserialize against the real schema, and the
+    /// settings it documents must actually take effect — a regression guard for
+    /// key-name drift (`pac_location` vs `pac_file`, singular `ingress_interface`).
+    #[test]
+    fn example_config_deserializes_and_fields_apply() {
+        let cfg: TotanConfig =
+            toml::from_str(&example_toml()).expect("example must deserialize against schema");
+        assert!(
+            cfg.pac_file.is_some(),
+            "documented PAC file must populate `pac_file`, not be silently dropped"
+        );
+        assert!(
+            !cfg.ebpf.ingress_interfaces.is_empty(),
+            "documented ingress interface must populate `ingress_interfaces`"
+        );
+    }
+
+    /// Unknown / mistyped keys must be a hard error instead of being silently
+    /// ignored, so config drift surfaces at load time.
+    #[test]
+    fn unknown_config_key_is_rejected() {
+        let res: Result<TotanConfig, _> =
+            toml::from_str("listen_port = 3129\nbogus_unknown_key = 42\n");
+        assert!(res.is_err(), "unknown top-level key must be rejected");
+    }
+
+    #[test]
+    fn unknown_nested_key_is_rejected() {
+        let res: Result<TotanConfig, _> = toml::from_str("[ebpf]\nexclude_uids = [0]\n");
+        assert!(
+            res.is_err(),
+            "unknown key in a nested section must be rejected"
+        );
+    }
+}

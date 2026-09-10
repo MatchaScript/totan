@@ -1,0 +1,619 @@
+//! totan-ebpf — kernel-side BPF programs for transparent TCP/80 and TCP/443 proxy.
+//!
+//! Two independent interception subsystems share this ELF:
+//!
+//! ## Subsystem A: tc ingress for client-originated traffic (pod / VM)
+//!
+//! 1. Packet from a client (e.g. pod, container) arrives on the host side of
+//!    the pair device (veth / netkit) where this program is attached as tcx
+//!    ingress.
+//! 2. If dst port is 80 or 443, look up the TPROXY listener socket via
+//!    `bpf_skc_lookup_tcp`.
+//! 3. Assign the socket with `bpf_sk_assign` and set `skb->mark` to the
+//!    configured fwmark, then return `TC_ACT_OK` so the packet continues into
+//!    the IP stack.
+//! 4. Userspace policy routing (`ip rule fwmark <N> lookup 100` +
+//!    `ip route add local 0.0.0.0/0 dev lo table 100`) makes the kernel treat
+//!    the packet as locally destined; `tcp_v4_rcv` then picks up the
+//!    pre-assigned socket via `__inet_lookup_skb` and delivers the SYN to the
+//!    TPROXY listener.
+//!
+//! `bpf_sk_assign` is **tc-ingress only** at the kernel level
+//! (`net/core/filter.c`: `if (!skb_at_tc_ingress(skb)) return -EOPNOTSUPP;`).
+//! Attaching this program to tc egress would make every `sk_assign` call
+//! return -95 and the interception would silently no-op.
+//!
+//! ## Subsystem B: cgroup hooks for host-originated traffic
+//!
+//! tc ingress only catches packets traversing a tc hook on the host. Host
+//! processes (kubelet, containerd, dnf, ssh sessions) emit packets directly
+//! via the physical NIC's egress and never hit any `lxc*` ingress, so they
+//! would escape totan entirely. To capture them we hook `connect(2)` itself
+//! at the cgroup layer:
+//!
+//! 1. `cgroup/connect4` (`totan_connect4`) fires before the kernel issues
+//!    the SYN. It saves the original (`user_ip4`, `user_port`) keyed by
+//!    socket cookie, then rewrites those fields to `127.0.0.1:redirect_port`
+//!    so the kernel actually connects to the local listener.
+//! 2. `sockops` (`totan_sockops`) fires at `BPF_SOCK_OPS_TCP_CONNECT_CB`
+//!    once the kernel has bound an ephemeral source port. It re-keys the
+//!    saved original-dst from cookie → ephemeral source port (host byte
+//!    order) so userspace can recover it via `peer_addr.port()`.
+//! 3. Cleanup: the accept loop evicts each `sport` entry right after it reads
+//!    it; entries for connections that are never accepted age out of the LRU
+//!    map. (A `cgroup/sock_release` hook would evict sooner, but that program
+//!    type cannot read `bpf_sock.src_port` — the verifier rejects the access
+//!    at any width — so the LRU bound is relied on instead.)
+//!
+//! Pattern lifted from Cilium socketLB (`reference/cilium/bpf/bpf_sock.c`),
+//! adapted for the transparent-proxy case where userspace **must** know the
+//! original destination (whereas Cilium hides it in the kernel via
+//! `cgroup/recvmsg4` reverse-NAT).
+
+#![no_std]
+#![no_main]
+
+use aya_ebpf::{
+    bindings::{bpf_sock_tuple, BPF_TCP_LISTEN, BPF_TCP_TIME_WAIT, TC_ACT_OK},
+    helpers::generated::{
+        bpf_get_socket_cookie, bpf_sk_assign, bpf_sk_release, bpf_skc_lookup_tcp,
+    },
+    macros::{cgroup_sock_addr, classifier, map, sock_ops},
+    maps::{Array, LruHashMap},
+    programs::{SockAddrContext, SockOpsContext, TcContext},
+};
+use core::mem;
+use network_types::{
+    eth::{EthHdr, EtherType},
+    ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
+    tcp::TcpHdr,
+};
+
+const AF_INET: u32 = 2;
+const AF_INET6: u32 = 10;
+
+/// Layout-compatible mirror of the userspace `TproxyConfig` in
+/// `totan/src/ebpf.rs`. Both sides must be updated together.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TproxyConfig {
+    /// Listener IPv4 address in network byte order (127.0.0.1 → 0x0100007F).
+    pub tproxy_ipv4_be: u32,
+    /// Listener IPv6 address as four network-byte-order u32 words.
+    pub tproxy_ipv6_be: [u32; 4],
+    /// Listener TCP port in network byte order.
+    pub tproxy_port_be: u16,
+    pub _pad0: u16,
+    /// fwmark placed on matched packets. Userspace must configure
+    /// `ip rule fwmark <N> lookup 100` + `ip route local 0.0.0.0/0 dev lo`
+    /// so the mark triggers local delivery instead of forwarding.
+    pub fwmark: u32,
+    pub _pad1: u32,
+}
+
+#[map(name = "TOTAN_CONFIG")]
+static TOTAN_CONFIG: Array<TproxyConfig> = Array::<TproxyConfig>::with_max_entries(1, 0);
+
+/// Mirror of the userspace `HostHookConfig` in `totan/src/cgroup.rs`.
+/// Both sides MUST be updated together.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct HostHookConfig {
+    /// Redirect target IPv4 in network byte order (typically 127.0.0.1 → 0x0100007F).
+    pub redirect_ipv4_be: u32,
+    /// Redirect target IPv6 as four network-byte-order u32 words (`::1`).
+    pub redirect_ipv6_be: [u32; 4],
+    /// Redirect target TCP port in network byte order.
+    pub redirect_port_be: u16,
+    pub _pad: u16,
+    /// Mark identifying totan's own sockets; connect4 skips matching sockets.
+    pub self_mark: u32,
+}
+
+#[map(name = "TOTAN_HOST_CFG")]
+static TOTAN_HOST_CFG: Array<HostHookConfig> = Array::<HostHookConfig>::with_max_entries(1, 0);
+
+/// Original destination preserved across the cgroup hook → sockops → accept
+/// pipeline. Layout-compatible with the userspace `OrigDst` in
+/// `totan/src/cgroup.rs`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct OrigDst {
+    /// Linux address family (`AF_INET` or `AF_INET6`).
+    pub family: u32,
+    /// Network-byte-order address words. IPv4 uses only index zero.
+    pub addr_be: [u32; 4],
+    /// Original destination port in network byte order.
+    pub port_be: u16,
+    pub _pad: u16,
+}
+
+/// Correlates an accepted localhost connection with its original destination.
+/// IPv4 and IPv6 have independent ephemeral-port spaces, so family is part of
+/// the key to prevent cross-family collisions.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SportKey {
+    pub family: u32,
+    pub port_be: u16,
+    pub _pad: u16,
+}
+
+/// Stage 1: connect4 stores `socket_cookie -> OrigDst`. The cookie is the
+/// only stable identifier available before the kernel has bound an
+/// ephemeral source port. LRU evicts stale entries automatically — pattern
+/// from Cilium `cilium_lb4_reverse_sk` (`bpf/lib/sock.h`).
+#[map(name = "TOTAN_OD_BY_COOKIE")]
+static TOTAN_OD_BY_COOKIE: LruHashMap<u64, OrigDst> =
+    LruHashMap::<u64, OrigDst>::with_max_entries(65536, 0);
+
+/// Stage 2: sockops re-keys to `sport_be -> OrigDst` once the kernel has
+/// bound the ephemeral source port. Userspace accept reads `peer_addr.port()`
+/// from the accepted localhost connection, converts it to network byte
+/// order, and looks it up here.
+#[map(name = "TOTAN_OD_BY_SPORT")]
+static TOTAN_OD_BY_SPORT: LruHashMap<SportKey, OrigDst> =
+    LruHashMap::<SportKey, OrigDst>::with_max_entries(65536, 0);
+
+/// `BPF_F_CURRENT_NETNS` (-1L cast to u64): look up socket in the current netns.
+const BPF_F_CURRENT_NETNS: u64 = u64::MAX;
+
+/// Linux ABI: SOCK_STREAM = 1.
+const SOCK_STREAM: u32 = 1;
+
+/// `bpf_sock_addr->type` is set for connect4; for AF_INET non-TCP we bail
+/// to keep UDP/QUIC out of the rewrite path.
+const IPPROTO_TCP: u32 = 6;
+
+/// sockops `op` codes from `include/uapi/linux/bpf.h`.
+const BPF_SOCK_OPS_TCP_CONNECT_CB: u32 = 3;
+
+#[classifier]
+pub fn totan_tc_ingress(ctx: TcContext) -> i32 {
+    try_ingress(&ctx).unwrap_or(TC_ACT_OK as i32)
+}
+
+#[inline(always)]
+fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
+    let eth: EthHdr = ctx.load(0).map_err(|_| ())?;
+    // Copy out the packed field before comparing — taking &eth.ether_type
+    // on a #[repr(C, packed)] struct is UB under rustc ≥ 1.94 (E0793).
+    let ether_type = eth.ether_type;
+    if ether_type == EtherType::Ipv4.into() {
+        return try_ingress_v4(ctx);
+    }
+    if ether_type == EtherType::Ipv6.into() {
+        return try_ingress_v6(ctx);
+    }
+
+    Ok(TC_ACT_OK as i32)
+}
+
+#[inline(always)]
+fn try_ingress_v4(ctx: &TcContext) -> Result<i32, ()> {
+    let ipv4: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
+    if ipv4.proto != IpProto::Tcp.into() {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    // Bail on IPv4 options (IHL > 5); the TcpHdr offset would shift and we'd
+    // parse garbage. Standard HTTP/HTTPS traffic never carries IP options.
+    if ipv4.ihl() as usize != Ipv4Hdr::LEN {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    // Non-initial IPv4 fragments carry no L4 header — the TcpHdr at the fixed
+    // offset would be payload bytes misread as ports/flags. Let the kernel
+    // reassemble them; only the first fragment (offset 0) is a real SYN.
+    if ipv4.frag_offset() != 0 {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    let tcp: TcpHdr = ctx.load(EthHdr::LEN + Ipv4Hdr::LEN).map_err(|_| ())?;
+    let dst_port = u16::from_be_bytes(tcp.dest);
+    if dst_port != 80 && dst_port != 443 {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    let cfg = TOTAN_CONFIG.get(0).ok_or(())?;
+    let raw_skb: *mut aya_ebpf::bindings::__sk_buff = ctx.skb.skb;
+    let skb: *mut core::ffi::c_void = raw_skb as *mut _;
+
+    // Cilium's established proxy path re-looks up the transparent child
+    // socket by the packet's full tuple and assigns that socket again. This
+    // distinguishes our intercepted flows from connections that pre-date a
+    // dynamic tc attach: the latter have no matching socket in the host netns.
+    if tcp.syn() == 0 || tcp.ack() != 0 {
+        let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
+        tuple.__bindgen_anon_1.ipv4.saddr = u32::from_ne_bytes(ipv4.src_addr);
+        tuple.__bindgen_anon_1.ipv4.daddr = u32::from_ne_bytes(ipv4.dst_addr);
+        tuple.__bindgen_anon_1.ipv4.sport = u16::from_ne_bytes(tcp.source);
+        tuple.__bindgen_anon_1.ipv4.dport = u16::from_ne_bytes(tcp.dest);
+        let tuple_size = mem::size_of_val(unsafe { &tuple.__bindgen_anon_1.ipv4 }) as u32;
+        let sk = unsafe {
+            bpf_skc_lookup_tcp(
+                skb,
+                &mut tuple as *mut bpf_sock_tuple,
+                tuple_size,
+                BPF_F_CURRENT_NETNS,
+                0,
+            )
+        };
+        if sk.is_null() {
+            return Ok(TC_ACT_OK as i32);
+        }
+        let state = unsafe { (*sk).state };
+        if state != BPF_TCP_LISTEN && state != BPF_TCP_TIME_WAIT {
+            let assigned = unsafe { bpf_sk_assign(skb, sk as *mut _, 0) };
+            if assigned == 0 {
+                unsafe { (*raw_skb).mark = cfg.fwmark };
+            }
+        }
+        unsafe { bpf_sk_release(sk as *mut _) };
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    // Build a 4-tuple keyed only on the listener (src fields zeroed): this
+    // matches the passively-listening TPROXY socket regardless of the flow.
+    let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
+    // Writes to Copy union fields are safe (RFC 1444); no unsafe block needed.
+    tuple.__bindgen_anon_1.ipv4.saddr = 0;
+    tuple.__bindgen_anon_1.ipv4.sport = 0;
+    tuple.__bindgen_anon_1.ipv4.daddr = cfg.tproxy_ipv4_be;
+    tuple.__bindgen_anon_1.ipv4.dport = cfg.tproxy_port_be;
+    let tuple_size = mem::size_of_val(unsafe { &tuple.__bindgen_anon_1.ipv4 }) as u32;
+
+    let sk = unsafe {
+        bpf_skc_lookup_tcp(
+            skb,
+            &mut tuple as *mut bpf_sock_tuple,
+            tuple_size,
+            BPF_F_CURRENT_NETNS,
+            0,
+        )
+    };
+    if sk.is_null() {
+        return Ok(TC_ACT_OK as i32);
+    }
+    let assigned = unsafe { bpf_sk_assign(skb, sk as *mut _, 0) };
+    unsafe { bpf_sk_release(sk as *mut _) };
+    if assigned == 0 {
+        unsafe { (*raw_skb).mark = cfg.fwmark };
+    }
+
+    Ok(TC_ACT_OK as i32)
+}
+
+/// Return the TCP header offset for an IPv6 packet. At most four extension
+/// headers are followed, matching Cilium's verifier-bounded limit. Fragmented
+/// packets are passed through because non-initial fragments do not carry TCP
+/// ports and assigning only a subset of a fragmented flow would be unsafe.
+#[inline(always)]
+fn ipv6_tcp_offset(ctx: &TcContext, mut next_header: u8) -> Result<Option<usize>, ()> {
+    const HOP_BY_HOP: u8 = 0;
+    const TCP: u8 = 6;
+    const ROUTING: u8 = 43;
+    const FRAGMENT: u8 = 44;
+    const AUTH: u8 = 51;
+    const NO_NEXT_HEADER: u8 = 59;
+    const DEST_OPTIONS: u8 = 60;
+
+    let mut offset = EthHdr::LEN + Ipv6Hdr::LEN;
+    for _ in 0..4 {
+        match next_header {
+            TCP => return Ok(Some(offset)),
+            FRAGMENT | NO_NEXT_HEADER => return Ok(None),
+            HOP_BY_HOP | ROUTING | DEST_OPTIONS | AUTH => {
+                let current_header = next_header;
+                let header: [u8; 2] = ctx.load(offset).map_err(|_| ())?;
+                next_header = header[0];
+                let length = if current_header == AUTH {
+                    (header[1] as usize + 2) * 4
+                } else {
+                    (header[1] as usize + 1) * 8
+                };
+                offset += length;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+#[inline(always)]
+fn try_ingress_v6(ctx: &TcContext) -> Result<i32, ()> {
+    let ipv6: Ipv6Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
+    let Some(tcp_offset) = ipv6_tcp_offset(ctx, ipv6.next_hdr)? else {
+        return Ok(TC_ACT_OK as i32);
+    };
+    let tcp: TcpHdr = ctx.load(tcp_offset).map_err(|_| ())?;
+    let dst_port = u16::from_be_bytes(tcp.dest);
+    if dst_port != 80 && dst_port != 443 {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    let cfg = TOTAN_CONFIG.get(0).ok_or(())?;
+    let raw_skb: *mut aya_ebpf::bindings::__sk_buff = ctx.skb.skb;
+    let skb: *mut core::ffi::c_void = raw_skb as *mut _;
+    if tcp.syn() == 0 || tcp.ack() != 0 {
+        let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
+        tuple.__bindgen_anon_1.ipv6.saddr = [
+            u32::from_ne_bytes([
+                ipv6.src_addr[0],
+                ipv6.src_addr[1],
+                ipv6.src_addr[2],
+                ipv6.src_addr[3],
+            ]),
+            u32::from_ne_bytes([
+                ipv6.src_addr[4],
+                ipv6.src_addr[5],
+                ipv6.src_addr[6],
+                ipv6.src_addr[7],
+            ]),
+            u32::from_ne_bytes([
+                ipv6.src_addr[8],
+                ipv6.src_addr[9],
+                ipv6.src_addr[10],
+                ipv6.src_addr[11],
+            ]),
+            u32::from_ne_bytes([
+                ipv6.src_addr[12],
+                ipv6.src_addr[13],
+                ipv6.src_addr[14],
+                ipv6.src_addr[15],
+            ]),
+        ];
+        tuple.__bindgen_anon_1.ipv6.daddr = [
+            u32::from_ne_bytes([
+                ipv6.dst_addr[0],
+                ipv6.dst_addr[1],
+                ipv6.dst_addr[2],
+                ipv6.dst_addr[3],
+            ]),
+            u32::from_ne_bytes([
+                ipv6.dst_addr[4],
+                ipv6.dst_addr[5],
+                ipv6.dst_addr[6],
+                ipv6.dst_addr[7],
+            ]),
+            u32::from_ne_bytes([
+                ipv6.dst_addr[8],
+                ipv6.dst_addr[9],
+                ipv6.dst_addr[10],
+                ipv6.dst_addr[11],
+            ]),
+            u32::from_ne_bytes([
+                ipv6.dst_addr[12],
+                ipv6.dst_addr[13],
+                ipv6.dst_addr[14],
+                ipv6.dst_addr[15],
+            ]),
+        ];
+        tuple.__bindgen_anon_1.ipv6.sport = u16::from_ne_bytes(tcp.source);
+        tuple.__bindgen_anon_1.ipv6.dport = u16::from_ne_bytes(tcp.dest);
+        let tuple_size = mem::size_of_val(unsafe { &tuple.__bindgen_anon_1.ipv6 }) as u32;
+        let sk = unsafe {
+            bpf_skc_lookup_tcp(
+                skb,
+                &mut tuple as *mut bpf_sock_tuple,
+                tuple_size,
+                BPF_F_CURRENT_NETNS,
+                0,
+            )
+        };
+        if sk.is_null() {
+            return Ok(TC_ACT_OK as i32);
+        }
+        let state = unsafe { (*sk).state };
+        if state != BPF_TCP_LISTEN && state != BPF_TCP_TIME_WAIT {
+            let assigned = unsafe { bpf_sk_assign(skb, sk as *mut _, 0) };
+            if assigned == 0 {
+                unsafe { (*raw_skb).mark = cfg.fwmark };
+            }
+        }
+        unsafe { bpf_sk_release(sk as *mut _) };
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
+    tuple.__bindgen_anon_1.ipv6.saddr = [0; 4];
+    tuple.__bindgen_anon_1.ipv6.sport = 0;
+    tuple.__bindgen_anon_1.ipv6.daddr = cfg.tproxy_ipv6_be;
+    tuple.__bindgen_anon_1.ipv6.dport = cfg.tproxy_port_be;
+    let tuple_size = mem::size_of_val(unsafe { &tuple.__bindgen_anon_1.ipv6 }) as u32;
+
+    let sk = unsafe {
+        bpf_skc_lookup_tcp(
+            skb,
+            &mut tuple as *mut bpf_sock_tuple,
+            tuple_size,
+            BPF_F_CURRENT_NETNS,
+            0,
+        )
+    };
+    if sk.is_null() {
+        return Ok(TC_ACT_OK as i32);
+    }
+
+    let assigned = unsafe { bpf_sk_assign(skb, sk as *mut _, 0) };
+    unsafe { bpf_sk_release(sk as *mut _) };
+    if assigned == 0 {
+        unsafe { (*raw_skb).mark = cfg.fwmark };
+    }
+
+    Ok(TC_ACT_OK as i32)
+}
+
+// ---------------------------------------------------------------------------
+// Subsystem B: cgroup hooks for host-originated traffic
+// ---------------------------------------------------------------------------
+
+/// `cgroup/connect4` fires from `__cgroup_bpf_run_filter_sock_addr` during
+/// `connect(2)` for IPv4 sockets in the attached cgroup. Returning 1 lets
+/// connect proceed with the (possibly mutated) sockaddr; 0 makes the kernel
+/// return -EPERM. We always return 1 so non-matching connections are
+/// untouched.
+#[cgroup_sock_addr(connect4)]
+pub fn totan_connect4(ctx: SockAddrContext) -> i32 {
+    try_connect4(&ctx).unwrap_or(1)
+}
+
+#[inline(always)]
+fn try_connect4(ctx: &SockAddrContext) -> Result<i32, ()> {
+    // SAFETY: ctx.sock_addr is a valid kernel-managed pointer for the
+    // lifetime of the hook invocation. All accesses below are on
+    // kernel-provided memory; no userspace pointers are dereferenced.
+    let sa = unsafe { &mut *ctx.sock_addr };
+
+    // Filter: TCP only.
+    if sa.type_ != SOCK_STREAM || sa.protocol != IPPROTO_TCP {
+        return Ok(1);
+    }
+
+    // Read user_port through a volatile to placate the verifier's narrow-
+    // access check on the kernel context. Pattern from Cilium
+    // `bpf/bpf_sock.c:50-72` (`ctx_dst_port`). user_port is stored in
+    // network byte order despite the __u32 type.
+    let raw_user_port: u32 = unsafe { core::ptr::read_volatile(&sa.user_port as *const u32) };
+    let dst_port_be: u16 = raw_user_port as u16;
+    let dst_port_host = u16::from_be(dst_port_be);
+    if dst_port_host != 80 && dst_port_host != 443 {
+        return Ok(1);
+    }
+
+    let cfg = TOTAN_HOST_CFG.get(0).ok_or(())?;
+
+    // Self-exclusion: totan tags its own outbound sockets with self_mark so we
+    // skip them here, breaking the connect→listener→reconnect loop. This lets
+    // totan run inside a hooked slice (e.g. system.slice) without looping.
+    // `sk` lives in an anonymous union (the `__bpf_md_ptr` ABI wrapper).
+    let sk = unsafe { sa.__bindgen_anon_1.sk };
+    if !sk.is_null() && cfg.self_mark != 0 {
+        let mark = unsafe { (*sk).mark };
+        if mark == cfg.self_mark {
+            return Ok(1);
+        }
+    }
+
+    let orig = OrigDst {
+        family: AF_INET,
+        addr_be: [sa.user_ip4, 0, 0, 0],
+        port_be: dst_port_be,
+        _pad: 0,
+    };
+    let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) };
+
+    // Do not redirect if metadata preservation failed. A fail-open connection
+    // is preferable to accepting it locally without a recoverable destination.
+    if TOTAN_OD_BY_COOKIE.insert(&cookie, &orig, 0).is_err() {
+        return Ok(1);
+    }
+
+    // Rewrite destination to the local listener.
+    sa.user_ip4 = cfg.redirect_ipv4_be;
+    sa.user_port = u32::from(cfg.redirect_port_be);
+
+    Ok(1)
+}
+
+/// IPv6 counterpart to `totan_connect4`. It preserves the 128-bit original
+/// destination and redirects the connection to `[::1]:redirect_port`.
+#[cgroup_sock_addr(connect6)]
+pub fn totan_connect6(ctx: SockAddrContext) -> i32 {
+    try_connect6(&ctx).unwrap_or(1)
+}
+
+#[inline(always)]
+fn try_connect6(ctx: &SockAddrContext) -> Result<i32, ()> {
+    let sa = unsafe { &mut *ctx.sock_addr };
+    if sa.type_ != SOCK_STREAM || sa.protocol != IPPROTO_TCP {
+        return Ok(1);
+    }
+
+    let raw_user_port: u32 = unsafe { core::ptr::read_volatile(&sa.user_port as *const u32) };
+    let dst_port_be = raw_user_port as u16;
+    let dst_port_host = u16::from_be(dst_port_be);
+    if dst_port_host != 80 && dst_port_host != 443 {
+        return Ok(1);
+    }
+
+    let cfg = TOTAN_HOST_CFG.get(0).ok_or(())?;
+    let sk = unsafe { sa.__bindgen_anon_1.sk };
+    if !sk.is_null() && cfg.self_mark != 0 && unsafe { (*sk).mark } == cfg.self_mark {
+        return Ok(1);
+    }
+
+    let orig = OrigDst {
+        family: AF_INET6,
+        // Spell out every word so LLVM emits fixed context offsets. A whole
+        // array copy is lowered through a derived pointer, which the
+        // BPF_PROG_TYPE_CGROUP_SOCK_ADDR verifier rejects.
+        addr_be: [
+            sa.user_ip6[0],
+            sa.user_ip6[1],
+            sa.user_ip6[2],
+            sa.user_ip6[3],
+        ],
+        port_be: dst_port_be,
+        _pad: 0,
+    };
+    let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) };
+    if TOTAN_OD_BY_COOKIE.insert(&cookie, &orig, 0).is_err() {
+        return Ok(1);
+    }
+
+    sa.user_ip6[0] = cfg.redirect_ipv6_be[0];
+    sa.user_ip6[1] = cfg.redirect_ipv6_be[1];
+    sa.user_ip6[2] = cfg.redirect_ipv6_be[2];
+    sa.user_ip6[3] = cfg.redirect_ipv6_be[3];
+    sa.user_port = u32::from(cfg.redirect_port_be);
+
+    Ok(1)
+}
+
+/// Sockops re-keys cookie → ephemeral source port at active-connect time.
+/// The cgroup must be the same one we attached `connect4` to so the cookie
+/// matches.
+#[sock_ops]
+pub fn totan_sockops(ctx: SockOpsContext) -> u32 {
+    let _ = try_sockops(&ctx);
+    0
+}
+
+#[inline(always)]
+fn try_sockops(ctx: &SockOpsContext) -> Result<(), ()> {
+    if ctx.op() != BPF_SOCK_OPS_TCP_CONNECT_CB {
+        return Ok(());
+    }
+    let cookie = unsafe { bpf_get_socket_cookie(ctx.ops as *mut _) };
+    // SAFETY: LruHashMap::get returns a reference valid for the program
+    // duration; we copy out before any mutation.
+    let orig = match unsafe { TOTAN_OD_BY_COOKIE.get(&cookie) } {
+        Some(v) => *v,
+        None => return Ok(()), // not one of ours
+    };
+    // local_port is host byte order; map key is network byte order to match
+    // what userspace gets from `peer_addr.port().to_be()`.
+    let key = SportKey {
+        family: orig.family,
+        port_be: (ctx.local_port() as u16).to_be(),
+        _pad: 0,
+    };
+    if TOTAN_OD_BY_SPORT.insert(&key, &orig, 0).is_ok() {
+        let _ = TOTAN_OD_BY_COOKIE.remove(&cookie);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+// GPL license section required for bpf_sk_assign and bpf_skc_lookup_tcp helpers.
+#[link_section = "license"]
+#[used]
+static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
