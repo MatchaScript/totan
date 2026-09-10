@@ -30,7 +30,7 @@ aya-log = { workspace = true }
 libc = "0.2"
 
 http = "1.3"
-pingora = { version = "0.9.0", features = ["proxy"] }
+pingora = { version = "0.8.0", features = ["proxy"] }
 async-trait = "0.1"
 
 # `aya-build` drives the bpfel-unknown-none compile of `totan-ebpf` from

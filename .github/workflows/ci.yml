@@ -9,18 +9,8 @@ on:
 
 jobs:
   build:
-    name: Check, Test & Build (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-            rust_arch: x86_64
-          - arch: arm64
-            runner: ubuntu-26.04-arm
-            rust_arch: aarch64
+    name: Check, Test & Build
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -35,7 +25,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/bpf-linker
-          key: bpf-linker-${{ runner.os }}-${{ matrix.rust_arch }}-v0.11.0
+          key: bpf-linker-${{ runner.os }}-x86_64-v0.11.0
 
       - name: Install bpf-linker
         if: steps.cache-bpf-linker.outputs.cache-hit != 'true'
@@ -43,7 +33,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y zstd
           curl -fsSL -o /tmp/bpf-linker.tar.zst \
-            https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-${{ matrix.rust_arch }}-unknown-linux-musl.tar.zst
+            https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst
           tar -xpf /tmp/bpf-linker.tar.zst -C ~/.cargo/bin
           bpf-linker --version
 
@@ -61,7 +51,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: totan-release-${{ matrix.arch }}
+          name: totan-release
           path: target/release/totan
           retention-days: 1
 
@@ -73,7 +63,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          name: totan-release-amd64
+          name: totan-release
           path: target/release/
       - name: Make totan executable
         run: chmod +x target/release/totan
