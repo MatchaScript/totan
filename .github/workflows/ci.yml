@@ -23,7 +23,7 @@ jobs:
             rust_arch: aarch64
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: clippy, rustfmt
 
