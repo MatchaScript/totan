@@ -4,6 +4,7 @@ members = [
 	"totan",
 	"totan-common",
 	"totan-ebpf",
+	"totan-vminit",
 ]
 
 # `totan-ebpf` targets `bpfel-unknown-none` via its own `.cargo/config.toml`
@@ -13,6 +14,7 @@ members = [
 default-members = [
 	"totan",
 	"totan-common",
+	"totan-vminit",
 ]
 
 resolver = "2"

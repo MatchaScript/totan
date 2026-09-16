@@ -337,16 +337,12 @@ impl ProxyHttp for TotanHttpProxy {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
-        // RFC 7230 §5.3.2: a client speaking to a forward proxy MUST use the
+        // RFC 9112 §3.2.2: a client speaking to a forward proxy MUST use the
         // absolute-form request-target (`GET http://host/path HTTP/1.1`).
-        // pingora's H1 wire encoder emits `req.raw_path()`, which falls
-        // through to `uri.path_and_query().as_str()`. Parsing
-        // `"http://host/"` as a `http::Uri` puts everything except the path
-        // into the scheme/authority — `path_and_query()` then returns just
-        // `"/"` and we end up sending origin-form. To force the entire
-        // absolute string onto the wire, build the Uri with the absolute
-        // string as the *path-and-query* directly: it's stored verbatim and
-        // surfaces unchanged from `path_and_query().as_str()`.
+        // pingora's H1 wire encoder emits `req.raw_path()`, and `set_raw_path`
+        // keeps an absolute-form target verbatim for it while storing only the
+        // path component in the Uri. `set_uri` cannot express this: a Uri
+        // renders back as origin-form.
         let host = upstream_request
             .headers
             .get(http::header::HOST)
@@ -372,13 +368,7 @@ impl ProxyHttp for TotanHttpProxy {
             }
         };
 
-        let new_uri = http::Uri::builder()
-            .path_and_query(wire_target.as_str())
-            .build()
-            .map_err(|e| {
-                pingora::Error::explain(pingora::ErrorType::InternalError, e.to_string())
-            })?;
-        upstream_request.set_uri(new_uri);
+        upstream_request.set_raw_path(wire_target.as_bytes())?;
 
         upstream_request.insert_header("Host", host).map_err(|e| {
             pingora::Error::explain(pingora::ErrorType::InternalError, e.to_string())

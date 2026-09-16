@@ -1,0 +1,22 @@
+# Init image for apple/container that runs totan inside the container VM.
+#
+# The base image tag must match `scVersion` in the Package.swift of the
+# apple/container release in use: 0.45.0 for container 1.4.1.
+#
+# The build context holds the arm64 `totan` and `totan-vminit` binaries. The
+# release workflow puts them there and pushes the result to
+# ghcr.io/matchascript/totan-init:<version>. The image carries the example
+# configuration; put your own proxy in with a two-line Containerfile on top of
+# it (see README.md).
+
+ARG VMINIT_IMAGE=ghcr.io/apple/containerization/vminit:0.45.0
+
+FROM ${VMINIT_IMAGE} AS base
+
+FROM ${VMINIT_IMAGE}
+# vminitd is PID 1 in the VM. totan-vminit forks the process that waits for
+# cgroup v2 and starts totan, then execs the stock init.
+COPY --from=base /sbin/vminitd /sbin/vminitd.real
+COPY totan /usr/local/bin/totan
+COPY totan-vminit /sbin/vminitd
+COPY config.example.toml /etc/totan/config.toml
