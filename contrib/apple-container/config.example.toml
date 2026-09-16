@@ -1,0 +1,26 @@
+# totan configuration for the apple/container init image.
+#
+# The image carries this file as /etc/totan/config.toml. Replace it with your
+# own copy through a Containerfile on top of the published image, so the proxy
+# address stays on your machine. See README.md.
+
+listen_port = 3129
+
+# The HTTP CONNECT proxy the VM reaches the network through.
+default_proxy = "http://proxy.example.com:8080"
+
+[logging]
+level = "info"
+# Plain text: these lines land on the VM console, which `container logs --boot`
+# prints.
+format = "text"
+
+[ebpf]
+# Host hooks only. The processes to intercept run in this VM, so no traffic
+# arrives over a host-side veth for the tc ingress program to pick up.
+ingress_interfaces = []
+
+[ebpf.host_hooks]
+# The whole cgroup v2 tree: the container payload is a descendant of the root
+# cgroup, and the VM has no kubepods.slice to keep out of.
+slices = ["/sys/fs/cgroup"]
