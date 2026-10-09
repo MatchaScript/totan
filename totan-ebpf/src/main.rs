@@ -56,7 +56,8 @@
 use aya_ebpf::{
     bindings::{bpf_sock_tuple, BPF_TCP_LISTEN, BPF_TCP_TIME_WAIT, TC_ACT_OK},
     helpers::generated::{
-        bpf_get_socket_cookie, bpf_sk_assign, bpf_sk_release, bpf_skc_lookup_tcp,
+        bpf_get_netns_cookie, bpf_get_socket_cookie, bpf_sk_assign, bpf_sk_release,
+        bpf_skc_lookup_tcp,
     },
     macros::{cgroup_sock_addr, classifier, map, sock_ops},
     maps::{Array, LruHashMap},
@@ -108,6 +109,10 @@ pub struct HostHookConfig {
     pub _pad: u16,
     /// Mark identifying totan's own sockets; connect4 skips matching sockets.
     pub self_mark: u32,
+    pub _pad1: u32,
+    /// Cookie of totan's network namespace, where the redirect listeners
+    /// live. connect4/connect6 redirect only sockets in this netns.
+    pub netns_cookie: u64,
 }
 
 #[map(name = "TOTAN_HOST_CFG")]
@@ -483,6 +488,14 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, ()> {
 
     let cfg = TOTAN_HOST_CFG.get(0).ok_or(())?;
 
+    // The redirect listener exists only in totan's netns. A cgroup hook fires
+    // for every netns, so a socket from another netns in a hooked slice (e.g.
+    // a container under system.slice) would be sent to its own loopback,
+    // where nothing listens. Leave such connects untouched.
+    if unsafe { bpf_get_netns_cookie(ctx.sock_addr as *mut _) } != cfg.netns_cookie {
+        return Ok(1);
+    }
+
     // Self-exclusion: totan tags its own outbound sockets with self_mark so we
     // skip them here, breaking the connect→listener→reconnect loop. This lets
     // totan run inside a hooked slice (e.g. system.slice) without looping.
@@ -538,6 +551,10 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, ()> {
     }
 
     let cfg = TOTAN_HOST_CFG.get(0).ok_or(())?;
+    // Same netns check as connect4: the listener is only in totan's netns.
+    if unsafe { bpf_get_netns_cookie(ctx.sock_addr as *mut _) } != cfg.netns_cookie {
+        return Ok(1);
+    }
     let sk = unsafe { sa.__bindgen_anon_1.sk };
     if !sk.is_null() && cfg.self_mark != 0 && unsafe { (*sk).mark } == cfg.self_mark {
         return Ok(1);

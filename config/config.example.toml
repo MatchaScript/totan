@@ -38,7 +38,7 @@ pac_file = "/etc/totan/config.pac"
 #       run inside a hooked slice (e.g. a systemd unit in system.slice) without
 #       looping its own upstream traffic.
 #
-#   Requires: Linux kernel ≥ 6.6 (tcx multi-prog support), CAP_NET_ADMIN + CAP_BPF.
+#   Requires: Linux kernel ≥ 7.0, CAP_NET_ADMIN + CAP_BPF.
 
 [logging]
 # Log level: "trace", "debug", "info", "warn", or "error".
@@ -86,7 +86,7 @@ ingress_interfaces = ["veth-host"]
 # Captures egress from host processes (systemd services, login sessions, dnf,
 # ssh, …) that never traverses a pod-facing veth and so is invisible to tc
 # ingress. Loads cgroup/connect4 + sockops on the listed cgroup v2 slices.
-# Disabled when this section is absent. Requires cgroup v2 and kernel ≥ 5.7.
+# Disabled when this section is absent. Requires cgroup v2 and kernel ≥ 7.0.
 #
 # `ingress_interfaces` may be left empty ([]) to run host hooks ONLY (no tc
 # ingress); totan then starts even when no matching interface is present yet.

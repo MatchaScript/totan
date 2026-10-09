@@ -91,7 +91,9 @@ pub struct EbpfConfig {
 /// listed cgroup paths. Connections from processes inside those cgroups
 /// (and their descendants) targeting TCP/80 or TCP/443 are redirected
 /// to family-matched loopback listeners, where a plain TCP listener accepts
-/// them and recovers the original destination via a BPF map.
+/// them and recovers the original destination via a BPF map. Only sockets in
+/// totan's own network namespace are redirected; the listeners do not exist
+/// in other namespaces (e.g. containers under a hooked slice).
 ///
 /// Pod traffic is **not** affected by this — pod processes live under
 /// `kubepods.slice`, deliberately omitted from the default slice list.

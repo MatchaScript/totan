@@ -29,6 +29,8 @@
 # /sys/fs/cgroup/totan-e2e.slice. Host-originated curl scenarios are migrated
 # into that slice by writing $$ to cgroup.procs; connect4 rewrites their dst to
 # 127.0.0.1:33130 and userspace recovers original dst from the BPF sport map.
+# A process that is in the slice but in the pod netns must NOT be redirected:
+# totan's loopback listener does not exist in that netns.
 #
 # Scenario layout (host→target mapping via curl --resolve, all in TEST-NET):
 #   plain.test        → 192.0.2.10  :80   plain HTTP → proxy-default → backend
@@ -144,7 +146,7 @@ TLS_KEY="$LOG_DIR/backend.key"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
     -keyout "$TLS_KEY" -out "$TLS_CERT" \
     -subj "/CN=totan-e2e-backend" \
-    -addext "subjectAltName=DNS:a-site.test,DNS:b-site.test,DNS:other.test,DNS:fail-over.test,DNS:socks-only.test,DNS:v6-secure.test,DNS:v6-host.test,IP:127.0.0.1" \
+    -addext "subjectAltName=DNS:a-site.test,DNS:b-site.test,DNS:other.test,DNS:fail-over.test,DNS:socks-only.test,DNS:v6-secure.test,DNS:v6-host.test,IP:127.0.0.1,IP:::1" \
     2>/dev/null
 
 # Open the directory tree and certificate for clients in the pod namespace.
@@ -220,7 +222,7 @@ echo "[e2e] using config $TOTAN_CFG (pac=$PAC_PATH)"
 # ─── eBPF interception setup ─────────────────────────────────────────────────
 echo "[e2e] checking kernel version..."
 KVER=$(uname -r)
-echo "[e2e] kernel $KVER (need ≥ 6.6 for tcx)"
+echo "[e2e] kernel $KVER (need ≥ 7.0)"
 
 echo "[e2e] setting up pod netns..."
 sysctl -qw net.ipv4.conf.all.rp_filter=0
@@ -241,6 +243,25 @@ ip netns exec "$POD_NS" ip -6 addr add fd00:100::2/64 dev veth-pod nodad
 ip netns exec "$POD_NS" ip -6 route add default via fd00:100::1
 
 CURL_PREFIX=(ip netns exec "$POD_NS")
+
+# Backends that exist only inside the pod netns, on the intercepted ports.
+echo "[e2e] starting pod-local backends on 127.0.0.1:80 and [::1]:443..."
+BACKEND_POD_HTTP_LOG="$LOG_DIR/backend-pod-http.log"
+BACKEND_POD_TLS_LOG="$LOG_DIR/backend-pod-tls.log"
+"${CURL_PREFIX[@]}" env PORT=80 BIND=127.0.0.1 BACKEND_ID=pod-http \
+    LOGFILE="$BACKEND_POD_HTTP_LOG" python3 "$SCRIPT_DIR/mock-backend.py" &
+BACKEND_PIDS+=("$!")
+"${CURL_PREFIX[@]}" env PORT=443 BIND=::1 BACKEND_ID=pod-tls \
+    LOGFILE="$BACKEND_POD_TLS_LOG" TLS_CERT="$TLS_CERT" TLS_KEY="$TLS_KEY" \
+    python3 "$SCRIPT_DIR/mock-backend.py" &
+BACKEND_PIDS+=("$!")
+sleep 0.5
+for port in 80 443; do
+    if ! "${CURL_PREFIX[@]}" ss -tlnH "sport = :$port" | grep -q "$port"; then
+        echo "[e2e] pod-local listener on :$port failed to bind" >&2
+        exit 1
+    fi
+done
 
 # /sys/fs/cgroup/totan-e2e.slice must exist before totan starts so the cgroup
 # loader can open it for attach.
@@ -470,6 +491,16 @@ assert_eq "concurrent: ${conc_n}/${conc_n} requests succeeded" "$conc_n" "$oks"
         ' _ "${CURL_BASE[@]}" "$@" 2>&1 || true
     }
 
+    # Same as run_host_in_slice, but curl runs in the pod netns. The slice is
+    # joined first because `ip netns exec` remounts /sys, which hides
+    # /sys/fs/cgroup.
+    run_pod_in_slice() {
+        bash -c '
+            echo $$ > /sys/fs/cgroup/totan-e2e.slice/cgroup.procs
+            exec "$@"
+        ' _ "${CURL_PREFIX[@]}" "${CURL_BASE[@]}" "$@" 2>&1 || true
+    }
+
     echo
     echo "── scenario H1: host-originated HTTP via cgroup connect4 → proxy ──────"
     body=$(run_host_in_slice --resolve "plain.test:80:192.0.2.10" 'http://plain.test/')
@@ -496,6 +527,16 @@ assert_eq "concurrent: ${conc_n}/${conc_n} requests succeeded" "$conc_n" "$oks"
     assert_log_contains "$PROXY_DEFAULT_LOG" "CONNECT v6-host.test:443" "host-ipv6-https: proxy saw CONNECT"
     assert_log_contains "$BACKEND_TLS_LOG"   "GET / host=v6-host.test"  "host-ipv6-https: backend got request"
     assert_eq           "host-ipv6-https: body round-trip" "backend:backend-tls" "$body"
+
+    echo
+    echo "── scenario H4: in-slice process in another netns is NOT redirected ──"
+    # connect4/connect6 run for every socket in the slice regardless of its
+    # netns. Redirecting this connect would send it to 127.0.0.1:33130 or
+    # [::1]:33130 in the pod netns, where nothing listens (ECONNREFUSED).
+    body=$(run_pod_in_slice 'http://127.0.0.1/')
+    assert_eq "other-netns-ipv4-http: reached pod-local backend" "backend:pod-http" "$body"
+    body=$(run_pod_in_slice 'https://[::1]/')
+    assert_eq "other-netns-ipv6-https: reached pod-local backend" "backend:pod-tls" "$body"
 
     echo
     echo "── scenario H3: untracked host process (outside slice) is NOT redirected"

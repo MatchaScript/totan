@@ -15,7 +15,8 @@ Endpoints (the response body and status are the assertions):
     GET  /sleep/MS      → respond after MS milliseconds (timeouts/concurrency)
 
 Environment:
-    PORT       TCP port to bind on 127.0.0.1
+    PORT       TCP port to bind
+    BIND       Address to bind (default 127.0.0.1; an IPv6 literal binds IPv6)
     BACKEND_ID Identity string baked into "/" responses
     TLS_CERT   Optional path to a PEM cert; when set the listener is HTTPS
     TLS_KEY    Optional path to a PEM key
@@ -24,6 +25,7 @@ Environment:
 
 import http.server
 import os
+import socket
 import socketserver
 import ssl
 import sys
@@ -32,6 +34,7 @@ import time
 
 
 PORT = int(os.environ.get("PORT", "9080"))
+BIND = os.environ.get("BIND", "127.0.0.1")
 BACKEND_ID = os.environ.get("BACKEND_ID", "backend-default")
 LOGFILE = os.environ.get("LOGFILE", f"/tmp/mock-backend-{PORT}.log")
 TLS_CERT = os.environ.get("TLS_CERT")
@@ -120,7 +123,9 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def main() -> None:
     open(LOGFILE, "w").close()
-    server = ThreadedServer(("127.0.0.1", PORT), Handler)
+    if ":" in BIND:
+        ThreadedServer.address_family = socket.AF_INET6
+    server = ThreadedServer((BIND, PORT), Handler)
     scheme = "http"
     if TLS_CERT and TLS_KEY:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -128,7 +133,7 @@ def main() -> None:
         server.socket = ctx.wrap_socket(server.socket, server_side=True)
         scheme = "https"
     print(
-        f"[{BACKEND_ID}] backend listening on {scheme}://127.0.0.1:{PORT}"
+        f"[{BACKEND_ID}] backend listening on {scheme}://{BIND}:{PORT}"
         f"  log={LOGFILE}",
         flush=True,
     )

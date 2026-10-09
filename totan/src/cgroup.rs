@@ -13,12 +13,13 @@
 //!
 //! ## Why not the root cgroup
 //!
-//! Attaching to `/sys/fs/cgroup` would intercept pod traffic too,
-//! double-processing what `tc ingress` already handles and breaking the
-//! pod-internal loopback rewrite (the rewritten `127.0.0.1:port` would
-//! resolve to the pod netns loopback, where totan does not listen). The
-//! default slice list (`system.slice`, `user.slice`) covers systemd
-//! services and login sessions while leaving `kubepods.slice` untouched.
+//! connect4/connect6 leave sockets of other network namespaces alone, since
+//! the listener exists only in totan's netns, so pods and containers with
+//! their own netns are not intercepted wherever the programs are attached.
+//! The slice list decides which processes in totan's netns are intercepted.
+//! The default (`system.slice`, `user.slice`) covers systemd services and
+//! login sessions and leaves out `kubepods.slice`, whose hostNetwork pods
+//! share totan's netns.
 
 use std::fs::File;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -46,6 +47,8 @@ pub struct HostHookConfig {
     pub redirect_port_be: u16,
     pub _pad: u16,
     pub self_mark: u32,
+    pub _pad1: u32,
+    pub netns_cookie: u64,
 }
 // SAFETY: #[repr(C)], all fields are integers, explicit padding zeroes the
 // trailing bytes — the kernel verifier sees a fully initialised struct.
@@ -135,10 +138,10 @@ impl HostLoader {
         }
         let kv = aya::util::KernelVersion::current()
             .map_err(|e| anyhow::anyhow!("failed to read kernel version: {}", e))?;
-        let min = aya::util::KernelVersion::new(5, 7, 0);
+        let min = aya::util::KernelVersion::new(7, 0, 0);
         if kv < min {
             anyhow::bail!(
-                "kernel {:?} is too old for the cgroup BPF link API; need >= 5.7",
+                "kernel {:?} is too old; totan supports Linux >= 7.0",
                 kv
             );
         }
@@ -196,6 +199,8 @@ impl HostLoader {
                     redirect_port_be: redirect_port.to_be(),
                     _pad: 0,
                     self_mark,
+                    _pad1: 0,
+                    netns_cookie: own_netns_cookie()?,
                 },
                 0,
             )?;
@@ -243,6 +248,30 @@ fn ipv6_to_be_words(addr: Ipv6Addr) -> [u32; 4] {
     words
 }
 
+/// Cookie of the network namespace totan runs in. The redirect listeners are
+/// bound here, so connect4/connect6 redirect only sockets with this cookie.
+fn own_netns_cookie() -> Result<u64> {
+    use std::os::fd::AsRawFd;
+    let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+    let mut cookie: u64 = 0;
+    let mut len = std::mem::size_of_val(&cookie) as libc::socklen_t;
+    // SAFETY: valid fd owned by `sock`; `cookie` and `len` outlive the call.
+    let ret = unsafe {
+        libc::getsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NETNS_COOKIE,
+            &mut cookie as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("getsockopt(SO_NETNS_COOKIE) failed");
+    }
+    Ok(cookie)
+}
+
 fn attach_connect4(
     ebpf: &mut Ebpf,
     slices: &[PathBuf],
@@ -256,7 +285,7 @@ fn attach_connect4(
     for slice in slices {
         let f = File::open(slice).with_context(|| format!("opening cgroup {}", slice.display()))?;
         // `Single` here means `link_create.flags == 0`, NOT "only one program".
-        // check_prereqs() guarantees kernel >= 5.7, so aya takes the bpf_link
+        // check_prereqs() guarantees kernel >= 7.0, so aya takes the bpf_link
         // path, where the kernel requires the flags field to be zero and applies
         // multi semantics to links internally — so links still coexist with
         // Cilium's cgroup programs. Passing AllowMultiple (BPF_F_ALLOW_MULTI)
@@ -389,8 +418,8 @@ mod tests {
     fn host_hook_config_layout_is_stable() {
         // The kernel verifier rejects struct mismatches between the BPF
         // ELF's BTF and the userspace map definition. Pin the layout.
-        assert_eq!(core::mem::size_of::<HostHookConfig>(), 28);
-        assert_eq!(core::mem::align_of::<HostHookConfig>(), 4);
+        assert_eq!(core::mem::size_of::<HostHookConfig>(), 40);
+        assert_eq!(core::mem::align_of::<HostHookConfig>(), 8);
     }
 
     #[test]
