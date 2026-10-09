@@ -255,6 +255,9 @@ impl ProxyHttp for TotanHttpProxy {
         if !self.idle_timeout.is_zero() {
             session.set_keepalive(Some(self.idle_timeout.as_secs().max(1)));
         }
+        // apt pipelines requests. Without this, request N+1 arriving while
+        // response N is in flight fails the session with 400.
+        session.set_pipelining_enabled(true);
         Ok(false)
     }
 
@@ -530,6 +533,73 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), totan_task)
             .await
             .expect("Pingora connection loop did not stop after client close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn downstream_pipelined_request_is_served_after_the_first() {
+        // apt pipelines: request two arrives while response one is pending.
+        let upstream_proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_proxy_addr = upstream_proxy.local_addr().unwrap();
+        let (first_seen_tx, first_seen_rx) = tokio::sync::oneshot::channel();
+        let (second_sent_tx, second_sent_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream_proxy.accept().await.unwrap();
+            read_http_message(&mut stream).await;
+            first_seen_tx.send(()).unwrap();
+            second_sent_rx.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none")
+                .await
+                .unwrap();
+            let request = read_http_message(&mut stream).await;
+            assert!(String::from_utf8_lossy(&request).contains("GET http://example.com/two "));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo")
+                .await
+                .unwrap();
+        });
+
+        let intercepted = InterceptedConnection {
+            client_addr: "127.0.0.1:55555".parse().unwrap(),
+            original_dest: "192.0.2.10:80".parse().unwrap(),
+            sni_hostname: None,
+        };
+        let proxy_url = format!("http://127.0.0.1:{}", upstream_proxy_addr.port());
+        let ctx = HttpProxyContext::new(intercepted, &proxy_url, 0).unwrap();
+
+        let totan_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let totan_addr = totan_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = totan_listener.accept().await.unwrap();
+            serve_http_connection(stream, ctx).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(totan_addr).await.unwrap();
+        client
+            .write_all(b"GET /one HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        first_seen_rx.await.unwrap();
+        client
+            .write_all(b"GET /two HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        second_sent_tx.send(()).unwrap();
+
+        for body in [b"one", b"two"] {
+            let response =
+                tokio::time::timeout(Duration::from_secs(1), read_http_message(&mut client))
+                    .await
+                    .expect("pipelined response not delivered");
+            assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+            assert!(response.ends_with(body));
+        }
+        tokio::time::timeout(Duration::from_secs(1), proxy_task)
+            .await
+            .unwrap()
             .unwrap();
     }
 
