@@ -22,7 +22,7 @@ jobs:
             runner: ubuntu-26.04-arm
             rust_arch: aarch64
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt
@@ -32,7 +32,7 @@ jobs:
 
       - name: Cache bpf-linker
         id: cache-bpf-linker
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cargo/bin/bpf-linker
           key: bpf-linker-${{ runner.os }}-${{ matrix.rust_arch }}-v0.11.0
@@ -47,7 +47,7 @@ jobs:
           tar -xpf /tmp/bpf-linker.tar.zst -C ~/.cargo/bin
           bpf-linker --version
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Format
         run: cargo fmt --all --check
       - name: Check
@@ -59,7 +59,7 @@ jobs:
       - name: Build release binary
         run: cargo build --locked -p totan --release
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: totan-release-${{ matrix.arch }}
           path: target/release/totan
@@ -70,8 +70,8 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: totan-release-amd64
           path: target/release/
