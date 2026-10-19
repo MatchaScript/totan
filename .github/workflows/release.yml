@@ -30,8 +30,8 @@ jobs:
         with:
           targets: ${{ matrix.rust_arch }}-unknown-linux-musl
 
-      - name: Install nightly-2026-08-26 for the eBPF crate
-        run: rustup toolchain install nightly-2026-08-26 --component rust-src --profile minimal --no-self-update
+      - name: Install nightly-2026-10-18 for the eBPF crate
+        run: rustup toolchain install nightly-2026-10-18 --component rust-src --profile minimal --no-self-update
 
       - name: Install build dependencies
         # musl-tools links the userspace binaries against musl; cmake and zstd
