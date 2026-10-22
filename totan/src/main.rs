@@ -71,8 +71,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn setup_logging(config: &TotanConfig) -> anyhow::Result<()> {
-    use tracing_subscriber::fmt;
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{fmt, EnvFilter};
 
     let log_level = config.logging.level.as_str();
     let env_filter =

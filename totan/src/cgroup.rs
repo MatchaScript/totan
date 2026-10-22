@@ -27,12 +27,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use aya::{
-    include_bytes_aligned,
-    maps::{Array, HashMap as AyaHashMap, MapData},
-    programs::{CgroupAttachMode, CgroupSockAddr, SockOps},
-    Ebpf, EbpfLoader,
-};
+use aya::maps::{Array, HashMap as AyaHashMap, MapData};
+use aya::programs::{CgroupAttachMode, CgroupSockAddr, SockOps};
+use aya::{include_bytes_aligned, Ebpf, EbpfLoader};
 use aya_log::EbpfLogger;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -140,10 +137,7 @@ impl HostLoader {
             .map_err(|e| anyhow::anyhow!("failed to read kernel version: {}", e))?;
         let min = aya::util::KernelVersion::new(7, 0, 0);
         if kv < min {
-            anyhow::bail!(
-                "kernel {:?} is too old; totan supports Linux >= 7.0",
-                kv
-            );
+            anyhow::bail!("kernel {:?} is too old; totan supports Linux >= 7.0", kv);
         }
         Ok(())
     }
@@ -266,8 +260,7 @@ fn own_netns_cookie() -> Result<u64> {
         )
     };
     if ret != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("getsockopt(SO_NETNS_COOKIE) failed");
+        return Err(std::io::Error::last_os_error()).context("getsockopt(SO_NETNS_COOKIE) failed");
     }
     Ok(cookie)
 }

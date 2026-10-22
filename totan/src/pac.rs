@@ -16,21 +16,19 @@
 
 use crate::proxy::Proxies;
 use anyhow::Result;
+use boa_engine::class::Class;
 use boa_engine::{
-    class::Class, js_string, Context, JsData, JsNativeError, JsResult, JsString, JsValue,
-    NativeFunction, Source,
+    js_string, Context, JsData, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source,
 };
 use boa_gc::{Finalize, Trace};
 use lru::LruCache;
 use once_cell::sync::OnceCell;
-use std::{
-    collections::HashMap,
-    num::NonZeroUsize,
-    path::Path,
-    sync::Mutex,
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::path::Path;
+use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;

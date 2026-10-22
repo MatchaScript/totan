@@ -2,7 +2,8 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use totan_common::{config::TotanConfig, InterceptedConnection};
+use totan_common::config::TotanConfig;
+use totan_common::InterceptedConnection;
 use tracing::{debug, warn};
 
 use crate::pac::PacEvaluator;

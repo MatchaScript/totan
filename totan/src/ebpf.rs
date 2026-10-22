@@ -42,12 +42,10 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 
-use aya::{
-    include_bytes_aligned,
-    maps::Array,
-    programs::{tc::TcAttachOptions, LinkOrder, SchedClassifier, TcAttachType},
-    Ebpf, EbpfLoader,
-};
+use aya::maps::Array;
+use aya::programs::tc::TcAttachOptions;
+use aya::programs::{LinkOrder, SchedClassifier, TcAttachType};
+use aya::{include_bytes_aligned, Ebpf, EbpfLoader};
 use aya_log::EbpfLogger;
 use tracing::{info, warn};
 

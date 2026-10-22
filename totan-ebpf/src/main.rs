@@ -53,22 +53,17 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{
-    bindings::{bpf_sock_tuple, BPF_TCP_LISTEN, BPF_TCP_TIME_WAIT, TC_ACT_OK},
-    helpers::generated::{
-        bpf_get_netns_cookie, bpf_get_socket_cookie, bpf_sk_assign, bpf_sk_release,
-        bpf_skc_lookup_tcp,
-    },
-    macros::{cgroup_sock_addr, classifier, map, sock_ops},
-    maps::{Array, LruHashMap},
-    programs::{SockAddrContext, SockOpsContext, TcContext},
+use aya_ebpf::bindings::{bpf_sock_tuple, BPF_TCP_LISTEN, BPF_TCP_TIME_WAIT, TC_ACT_OK};
+use aya_ebpf::helpers::generated::{
+    bpf_get_netns_cookie, bpf_get_socket_cookie, bpf_sk_assign, bpf_sk_release, bpf_skc_lookup_tcp,
 };
+use aya_ebpf::macros::{cgroup_sock_addr, classifier, map, sock_ops};
+use aya_ebpf::maps::{Array, LruHashMap};
+use aya_ebpf::programs::{SockAddrContext, SockOpsContext, TcContext};
 use core::mem;
-use network_types::{
-    eth::{EthHdr, EtherType},
-    ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
-    tcp::TcpHdr,
-};
+use network_types::eth::{EthHdr, EtherType};
+use network_types::ip::{IpProto, Ipv4Hdr, Ipv6Hdr};
+use network_types::tcp::TcpHdr;
 
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 10;

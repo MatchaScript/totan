@@ -7,7 +7,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
-use totan_common::{config::ErrorMitigationConfig, InterceptedConnection, TotanError};
+use totan_common::config::ErrorMitigationConfig;
+use totan_common::{InterceptedConnection, TotanError};
 use tracing::{debug, warn};
 
 /// Distinguishes the two failure modes a PAC entry can hit:
